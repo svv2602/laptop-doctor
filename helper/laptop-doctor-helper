@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C.UTF-8"}
@@ -41,10 +42,26 @@ def set_battery_threshold(a):
     need(isinstance(bat, str) and re.fullmatch(r"BAT\d", bat), "battery")
     need(isinstance(val, int) and 50 <= val <= 100, "value")
     Path(f"/sys/class/power_supply/{bat}/charge_control_end_threshold").write_text(str(val))
+    # только add (загрузка): на change правило срабатывало бы при каждом событии батареи
+    # и откатывало ручную смену порога
     Path("/etc/udev/rules.d/81-battery-threshold.rules").write_text(
-        f'ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="{bat}", '
+        f'ACTION=="add", SUBSYSTEM=="power_supply", KERNEL=="{bat}", '
         f'ATTR{{charge_control_end_threshold}}="{val}"\n')
     return f"порог заряда {bat} = {val}% (правило udev обновлено)"
+
+
+def kick_charging(a):
+    """Контроллер Samsung может «застрять» и не заряжать при подключённой зарядке ниже порога.
+    Перезапись порога (100 → прежний) заставляет его пересмотреть состояние."""
+    bat = a.get("battery")
+    need(isinstance(bat, str) and re.fullmatch(r"BAT\d", bat), "battery")
+    f = Path(f"/sys/class/power_supply/{bat}/charge_control_end_threshold")
+    cur = f.read_text().strip()
+    need(cur.isdigit() and 1 <= int(cur) <= 100, "текущий порог")
+    f.write_text("100")
+    time.sleep(2)
+    f.write_text(cur)
+    return f"зарядка перезапущена (порог {cur}% → 100% → {cur}%)"
 
 
 def arc_autosuspend(a):
@@ -166,6 +183,7 @@ ACTIONS = {
     "apt-autoremove": apt_autoremove,
     "clean-crash": clean_crash,
     "swap-refresh": swap_refresh,
+    "kick-charging": kick_charging,
 }
 
 

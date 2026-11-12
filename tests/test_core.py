@@ -130,7 +130,7 @@ def test_helper_rejects_unknown_action(helper):
     assert set(helper.ACTIONS) == {
         "set-battery-threshold", "arc-autosuspend", "disable-units", "restart-units",
         "fix-remmina-socket", "journal-limit", "remove-snap-revisions", "apt-autoremove", "clean-crash",
-        "swap-refresh"}
+        "swap-refresh", "kick-charging"}
 
 
 def test_unit_label():
@@ -498,3 +498,34 @@ def test_before_after(monkeypatch):
     assert ba["resets_before"] == 2 and ba["resets_after"] == 0
     assert round(ba["days_before"]) == 8 and round(ba["days_after"]) == 2
     assert history.before_after(0, boots) is None
+
+
+def test_charging_stuck_detection(helper, monkeypatch, tmp_path):
+    log = "\n".join(f"acpitz=70 x86_pkg_temp=70 | ADP1=online:1 BAT1=Charging:{c}%:800000uA/14700000uV | load=1"
+                    for c in (55, 54, 53, 52, 51, 50, 49))
+    s = checks.parse_power_samples(log)
+    assert s[0] == (True, 55) and len(s) == 7
+    assert "с 55% до 49%" in checks.charging_stuck(s, 80)
+    assert checks.charging_stuck(s, 50) is None              # у порога — это нормальное удержание
+    unplugged = [(False, c) for _, c in s]
+    assert checks.charging_stuck(unplugged, 80) is None       # от батареи — разряд нормален
+    rising = [(True, c) for c in (40, 41, 42, 43, 44, 45)]
+    assert checks.charging_stuck(rising, 80) is None
+    recovered = [(True, c) for c in (46, 44, 42, 40, 38, 39, 40)]   # упало, но зарядка уже восстановилась
+    assert checks.charging_stuck(recovered, 80) is None
+    # helper: перезапись порога 100 → прежний
+    f = tmp_path / "thr"
+    f.write_text("80")
+    writes = []
+    real_path = helper.Path
+
+    class FakePath(type(real_path())):
+        def write_text(self, v, *a, **k):
+            writes.append(v)
+            return super().write_text(v, *a, **k)
+    monkeypatch.setattr(helper, "Path", lambda p: FakePath(str(f)))
+    monkeypatch.setattr(helper.time, "sleep", lambda s: None)
+    helper.kick_charging({"battery": "BAT1"})
+    assert writes == ["100", "80"] and f.read_text() == "80"
+    with pytest.raises(helper.Bad):
+        helper.kick_charging({"battery": "../../x"})

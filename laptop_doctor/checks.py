@@ -221,6 +221,29 @@ def check_temps(cfg: Config) -> CheckResult:
 
 # ---------------------------------------------------------------- battery
 
+def parse_power_samples(log: str) -> list[tuple[bool, int]]:
+    """Строки hw-watch → [(зарядка подключена, заряд %)]."""
+    res = []
+    for ln in log.splitlines():
+        ac = re.search(r"ADP\d=online:(\d)", ln)
+        bat = re.search(r"BAT\d=[^:\s]+:(\d+)%", ln)
+        if ac and bat:
+            res.append((ac.group(1) == "1", int(bat.group(1))))
+    return res
+
+
+def charging_stuck(samples: list[tuple[bool, int]], threshold: int) -> str | None:
+    """Зарядка подключена всё время, а заряд ниже порога и падает — контроллер не заряжает."""
+    if len(samples) < 6 or not all(ac for ac, _ in samples):
+        return None
+    first, last = samples[0][1], samples[-1][1]
+    recent = [c for _, c in samples[len(samples) // 2:]]
+    still_falling = recent[-1] < recent[0] and max(recent) == recent[0]  # во второй половине окна не росло
+    if first - last >= 3 and last < threshold - 2 and still_falling:
+        return f"заряд упал с {first}% до {last}% при подключённой зарядке"
+    return None
+
+
 def check_battery(cfg: Config) -> CheckResult:
     b = Path("/sys/class/power_supply") / cfg.battery
     if not b.exists():
@@ -234,6 +257,17 @@ def check_battery(cfg: Config) -> CheckResult:
     summary = f"{cap}% ({st}), порог {thr}%, износ: осталось {health} ёмкости"
     details = (f"Заряд: {cap}%, статус: {st}, от сети: {'да' if ac else 'нет'}\n"
                f"Порог заряда: {thr}%\nЁмкость: {health} от паспортной\nЦиклов: {cycles}")
+    log = run(["journalctl", "-u", "hw-watch", "--since", "-20min", "-o", "cat", "--no-pager"], timeout=20) or ""
+    stuck = charging_stuck(parse_power_samples(log), thr or 100)
+    if stuck:
+        fix = Fix("Перезапустить зарядку",
+                  "Зарядка подключена, но батарея разряжается. Контроллер Samsung после срабатывания порога "
+                  "может «застрять» и не брать питание от сети. Перезаписать порог (100% → прежний), "
+                  "чтобы он очнулся? Нужен пароль.\n\nЕсли не поможет — проверьте блок питания и кабель: "
+                  "он может выдавать слишком мало мощности.",
+                  root_actions=[{"action": "kick-charging", "battery": cfg.battery}])
+        return CheckResult("battery", "Батарея", Status.ERROR, f"Не заряжается: {stuck}",
+                           details + f"\n\nЗа последние 20 минут {stuck}.", fix)
     if thr is not None and thr != cfg.battery_threshold:
         fix = Fix(f"Вернуть порог {cfg.battery_threshold}%",
                   f"Установить порог заряда {cfg.battery_threshold}% (нужен пароль).",
