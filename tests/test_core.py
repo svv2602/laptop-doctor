@@ -449,3 +449,52 @@ def test_auto_clean(tmp_path, monkeypatch):
     freed, log = cleanup.run_auto_clean(cfg)
     assert freed == 4 and not any(cache.iterdir())  # root-цель пропущена
     assert not cleanup.auto_clean_due(cfg)
+
+
+def test_hw_watch_series(monkeypatch):
+    from laptop_doctor import history
+    log = ("1000.5 host hw-watch[1]: acpitz=77 TCPU=70 x86_pkg_temp=70 | ADP1=online:1 BAT1=Charging:96%:1uA/2uV | load=1\n"
+           "1010.5 host hw-watch[1]: acpitz=77 TCPU=90 x86_pkg_temp=90 | ADP1=online:1 BAT1=Charging:97%:1uA/2uV | load=1\n"
+           "1700.0 host hw-watch[1]: acpitz=77 TCPU=60 x86_pkg_temp=60 | ADP1=online:0 BAT1=Discharging:80%:1uA/2uV\n"
+           "garbage line\n")
+    monkeypatch.setattr(history, "run", lambda cmd, **kw: log)
+    temps, bats = history.hw_watch_series(0, 600)
+    assert temps == [(900.0, 70), (1500.0, 60)]   # p95 из [70, 90] при n=2 → первый элемент
+    assert bats == [(900.0, 97), (1500.0, 80)]     # последнее значение в корзине
+
+
+def test_throttle_series_and_events(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+
+    from laptop_doctor import history
+    rows = [{"ts": 0, "throttle_ms": 1000, "uptime": 100.0},
+            {"ts": 300, "throttle_ms": 31000, "uptime": 400.0},   # 30 с из 300 → 10%
+            {"ts": 600, "throttle_ms": 5, "uptime": 50.0},         # перезагрузка: счётчик сбросился
+            {"ts": 900, "throttle_ms": 5, "uptime": 350.0}]        # 0%
+    assert history.throttle_series(rows) == [(300, 10.0), (900, 0.0)]
+    monkeypatch.setattr(history, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(history, "EVENTS", tmp_path / "events.jsonl")
+    history.log_event("clean", "очистка диска")
+    now = datetime.now()
+    boots = [checks.BootEnd("a", now - timedelta(hours=2), now - timedelta(hours=1), False, ""),
+             checks.BootEnd("b", now - timedelta(hours=1), now, True, "")]
+    ev = history.load_events(0, boots)
+    assert [k for _, k, _ in ev] == ["reset", "clean"]
+
+
+def test_before_after(monkeypatch):
+    from datetime import datetime, timedelta
+
+    from laptop_doctor import history
+    fix = datetime.now() - timedelta(days=2)
+    f = fix.timestamp()
+    monkeypatch.setattr(history, "hw_watch_series",
+                        lambda since, b: ([(f - 7200, 95), (f - 3600, 93), (f + 3600, 75), (f + 7200, 79)], []))
+    boots = [checks.BootEnd("a", fix - timedelta(days=8), fix - timedelta(days=5), False, ""),
+             checks.BootEnd("b", fix - timedelta(days=5), fix - timedelta(days=1), False, ""),
+             checks.BootEnd("c", fix - timedelta(days=1), fix + timedelta(days=1), True, "")]
+    ba = history.before_after(f, boots)
+    assert ba["temp_before"] == 95 and ba["temp_after"] == 79
+    assert ba["resets_before"] == 2 and ba["resets_after"] == 0
+    assert round(ba["days_before"]) == 8 and round(ba["days_after"]) == 2
+    assert history.before_after(0, boots) is None

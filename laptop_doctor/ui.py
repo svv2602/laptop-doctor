@@ -13,16 +13,17 @@ from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSign
 from PyQt6.QtGui import QAction, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
-    QComboBox, QGridLayout,
+    QComboBox, QGridLayout, QScrollArea,
     QAbstractItemView, QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import actions, checks, cleanup, history, testguard
-from .charts import DayBarChart, LineChart
+from .charts import ChartSlot, DayBarChart, LineChart, SnapshotPanel
 from .checks import STATUS_LABEL, CheckResult, Status
 from .config import CONFIG_PATH, Config
+from .history import log_event
 from .util import human
 
 APP_ID = "laptop-doctor"
@@ -193,10 +194,13 @@ class MainWindow(QMainWindow):
             return
         fix = r.fix
         self.fix_btn.setEnabled(False)
-        self._job(lambda: actions.execute(fix.root_actions, fix.user_cmds, fix.py_action), self._fix_done)
+        self._job(lambda: actions.execute(fix.root_actions, fix.user_cmds, fix.py_action),
+                  lambda res, label=fix.label: self._fix_done(res, label))
 
-    def _fix_done(self, res):
+    def _fix_done(self, res, label=""):
         self.fix_btn.setEnabled(True)
+        if not isinstance(res, Exception) and res[0]:
+            log_event("fix", f"исправление: {label}")
         self._report(res)
         self.app.refresh()
 
@@ -320,6 +324,7 @@ class MainWindow(QMainWindow):
         else:
             ok, log = res
             self.clean_log.setPlainText(("Готово.\n" if ok else "Завершено с ошибками.\n") + log)
+            log_event("clean", "очистка диска")
         self.estimate()
         self.app.refresh()
 
@@ -341,49 +346,182 @@ class MainWindow(QMainWindow):
         top.addWidget(self.period)
         top.addWidget(self.hist_note, 1)
         lay.addLayout(top)
-        grid = QGridLayout()
-        self.ch_temp = LineChart("Температура CPU (p95)", "°C", y_min=None)
-        self.ch_mem = LineChart("Доступно памяти", "%", y_max=100)
-        self.ch_swap = LineChart("Занято swap", " ГБ", fmt="{:.2f}")
-        self.ch_resets = DayBarChart("Жёсткие сбросы за день")
-        grid.addWidget(self.ch_temp, 0, 0)
-        grid.addWidget(self.ch_resets, 0, 1)
-        grid.addWidget(self.ch_mem, 1, 0)
-        grid.addWidget(self.ch_swap, 1, 1)
-        lay.addLayout(grid, 1)
+
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        grid.setSpacing(8)
+        self.before_after = QLabel()
+        self.before_after.setTextFormat(Qt.TextFormat.RichText)
+        self.before_after.setWordWrap(True)
+        grid.addWidget(self.before_after, 0, 0, 1, 2)
+        self.slots: dict[str, ChartSlot] = {
+            "temp": ChartSlot(LineChart("Температура CPU (p95)", "°C", y_min=None), None),
+            "throttle": ChartSlot(LineChart("Троттлинг CPU, % времени", "%", fmt="{:.1f}", min_span=5),
+                                  SnapshotPanel("Троттлинг CPU сейчас")),
+            "ssd": ChartSlot(LineChart("Температура SSD", "°C", y_min=None, min_span=10),
+                             SnapshotPanel("SSD сейчас")),
+            "resets": ChartSlot(DayBarChart("Жёсткие сбросы за день"), None),
+            "mem": ChartSlot(LineChart("Доступно памяти", "%", y_max=100), SnapshotPanel("Память сейчас")),
+            "psi": ChartSlot(LineChart("Давление памяти (PSI, 1 мин)", "%", fmt="{:.1f}", min_span=5),
+                             SnapshotPanel("Давление памяти сейчас")),
+            "swap": ChartSlot(LineChart("Занято swap", " ГБ", fmt="{:.2f}", min_span=1), SnapshotPanel("Swap сейчас")),
+            "disk": ChartSlot(LineChart("Свободно на диске", " ГБ", min_span=20), SnapshotPanel("Диск сейчас")),
+            "battery": ChartSlot(LineChart("Заряд батареи", "%", y_max=100), None),
+        }
+        for i, sl in enumerate(self.slots.values()):
+            row, col = 1 + i // 2, i % 2
+            grid.addWidget(sl, row, col, 1, 2 if i == len(self.slots) - 1 and i % 2 == 0 else 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
         return w
 
     def load_history(self, *_):
         name, span, bucket = self.PERIODS[self.period.currentIndex()]
         now = time.time()
         t0 = now - span
+        cfg = self.app.cfg
 
         def collect():
+            boots = checks.finished_boots()
             rows = history.load(t0)
-            temps = history.temps_from_journal(t0, int(bucket))
+            temps, bats = history.hw_watch_series(t0, int(bucket))
             days = max(7, round(span / 86400))
-            resets = history.resets_per_day(checks.finished_boots(), days)
-            return rows, temps, resets
+            fix_ts = datetime.fromisoformat(cfg.fix_applied_since).timestamp() if cfg.fix_applied_since else 0
+            return {
+                "rows": rows, "temps": temps, "bats": bats,
+                "resets": history.resets_per_day(boots, days),
+                "events": history.load_events(t0, boots),
+                "snapshot": history.current_snapshot(),
+                "before_after": history.before_after(fix_ts, boots),
+            }
 
         self.hist_note.setText("Загружаю…")
-        self._job(collect, lambda res: self._history_loaded(res, t0, now, bucket))
+        # смена периода во время загрузки: ответ старого запроса отбрасываем, иначе он перезапишет новый
+        self.hist_req = getattr(self, "hist_req", 0) + 1
+        req = self.hist_req
+        self._job(collect, lambda res: self._history_loaded(res, t0, now, span, bucket, req))
 
-    def _history_loaded(self, res, t0, t1, bucket):
+    def _history_loaded(self, res, t0, t1, span, bucket, req=None):
+        if req is not None and req != self.hist_req:
+            return
         if isinstance(res, Exception):
             self.hist_note.setText(f"Ошибка: {res}")
             return
-        rows, temps, resets = res
-        self.ch_temp.set_data(temps, t0, t1, gap_s=bucket * 2.5)
-        self.ch_mem.set_data(history.series(rows, "mem_avail_pct"), t0, t1, gap_s=1800)
-        self.ch_swap.set_data(history.series(rows, "swap_used_gb"), t0, t1, gap_s=1800)
-        for ch in (self.ch_mem, self.ch_swap):
-            ch.empty_text = "История копится — замер раз в несколько минут"
-        self.ch_resets.set_data(resets)
+        rows, ev, snap = res["rows"], res["events"], res["snapshot"]
+        sl = self.slots
+        jgap = bucket * 2.5
+        sl["temp"].show_chart(res["temps"], t0, t1, jgap, ev)
+        sl["resets"].chart.set_data(res["resets"])
+        sl["battery"].show_chart(res["bats"] or history.series(rows, "battery_pct"), t0, t1,
+                                 jgap if res["bats"] else 1800, ev)
+
+        def own(slot, points, fill_snapshot):
+            # свой ряд: график, если история покрывает хотя бы пятую часть периода, иначе — текущее состояние
+            pts = list(points)
+            if len(pts) >= 6 and pts[-1][0] - pts[0][0] >= span * 0.2:
+                slot.show_chart(pts, t0, t1, 1800, ev)
+            else:
+                fill_snapshot(slot.snapshot)
+                slot.show_snapshot()
+
+        own(sl["mem"], history.series(rows, "mem_avail_pct"), lambda p: self._snap_mem(p, snap))
+        own(sl["psi"], history.series(rows, "psi60"), lambda p: self._snap_psi(p, snap))
+        own(sl["swap"], history.series(rows, "swap_used_gb"), lambda p: self._snap_swap(p, snap))
+        own(sl["disk"], history.series(rows, "disk_free_gb"), lambda p: self._snap_disk(p, snap))
+        own(sl["throttle"], history.throttle_series(rows), lambda p: self._snap_throttle(p, snap))
+        own(sl["ssd"], history.series(rows, "ssd_temp"), lambda p: self._snap_ssd(p, snap))
+        self.before_after.setText(self._before_after_html(res["before_after"]))
         first = min((r["ts"] for r in rows), default=None)
-        note = "Разрывы линий — ноутбук был выключен или спал. Наведите на график, чтобы увидеть значение."
+        note = ("Наведите на график, чтобы увидеть значение; разрывы линий — ноутбук был выключен. "
+                "Красная вертикаль — жёсткий сброс, серый пунктир — остановка тестов, очистка, исправление.")
         if first:
-            note += f" Память и swap записываются с {datetime.fromtimestamp(first):%d.%m %H:%M}."
+            note += (f" Свои замеры (память, swap, диск, SSD, троттлинг) — с {datetime.fromtimestamp(first):%d.%m %H:%M};"
+                     " пока их мало, вместо графика показано текущее состояние.")
         self.hist_note.setText(note)
+
+    # диаграммы текущего состояния
+    HINT = "Истории за период пока мало — показано текущее состояние."
+
+    def _snap_mem(self, p, snap):
+        mi = snap["mem"]
+        total, avail = mi.get("MemTotal", 0), mi.get("MemAvailable", 0)
+        cache = min(mi.get("Cached", 0) + mi.get("Buffers", 0), avail)
+        p.set_data(
+            headline=f"Доступно {human(avail)} из {human(total)}",
+            parts=[("Программы", total - avail, "series", human(total - avail)),
+                   ("Кэш файлов", cache, "series2", human(cache)),
+                   ("Свободно", avail - cache, "neutral", human(avail - cache))],
+            bars=[(name + (f" ×{n}" if n > 1 else ""), b, human(b)) for b, name, n in snap["top_apps"]],
+            bars_title="Больше всех занимают", note=self.HINT)
+
+    def _snap_psi(self, p, snap):
+        psi = snap["psi"]
+        p.set_data(headline=f"Процессы ждали память {psi.get('60', 0):.1f}% времени",
+                   meters=[(f"За {lbl}", psi.get(k, 0) / 100, f"{psi.get(k, 0):.1f}%")
+                           for k, lbl in (("10", "10 с"), ("60", "1 мин"), ("300", "5 мин"))],
+                   note="0% — нехватки нет, больше 5% — тормоза заметны. " + self.HINT)
+
+    def _snap_swap(self, p, snap):
+        mi = snap["mem"]
+        tot, used = mi.get("SwapTotal", 0), mi.get("SwapTotal", 0) - mi.get("SwapFree", 0)
+        p.set_data(headline=f"Занято {human(used)} из {human(tot)}" if tot else "Swap не настроен",
+                   meters=[("Заполнение swap", used / tot if tot else 0, f"{used / tot * 100 if tot else 0:.1f}%")],
+                   note=self.HINT)
+
+    def _snap_disk(self, p, snap):
+        tot, free = snap["disk_total"], snap["disk_free"]
+        p.set_data(headline=f"Свободно {human(free)} из {human(tot)}",
+                   meters=[("Занято", (tot - free) / tot, f"{(tot - free) / tot * 100:.0f}%")],
+                   bars=[(n, v, human(v)) for n, v in snap["disk_parts"] if v > 0],
+                   bars_title="Крупные потребители (быстро считаемые)", note=self.HINT)
+
+    def _snap_throttle(self, p, snap):
+        pct = snap["throttle_pct"]
+        p.set_data(headline=f"{pct:.1f}% времени с загрузки" if pct is not None else "Нет данных",
+                   meters=[("Доля времени в троттлинге", (pct or 0) / 100, f"{pct or 0:.1f}%")],
+                   note=f"С загрузки прошло {snap['uptime_h'] or 0:.1f} ч. " + self.HINT)
+
+    def _snap_ssd(self, p, snap):
+        a = snap["ssd"] or {}
+        temp = snap["ssd_temp"]
+        crit = (a.get("cctemp") or 358) - 273
+        warn = (a.get("wctemp") or 353) - 273
+        bars = []
+        if a:
+            bars = [(f"Выше {warn}°C", a.get("warning_temp_time", 0), f"{a.get('warning_temp_time', 0)} мин"),
+                    (f"Выше {crit}°C", a.get("critical_temp_time", 0), f"{a.get('critical_temp_time', 0)} мин")]
+        p.set_data(headline=f"{temp}°C" if temp is not None else "Нет данных",
+                   meters=[(f"До критической {crit}°C", (temp or 0) / crit, f"{temp}°C из {crit}°C")],
+                   bars=bars, bars_title="Всего за жизнь диска", note=self.HINT)
+
+    @staticmethod
+    def _before_after_html(ba) -> str:
+        if not ba:
+            return ("<b>До и после фикса</b>: задайте <code>fix_applied_since</code> в настройках, "
+                    "чтобы сравнить состояние до и после изменения.")
+
+        def cell(v, fmt):
+            return "—" if v is None else fmt.format(v)
+        rb = ba["resets_before"] / ba["days_before"] if ba["days_before"] else 0
+        ra = ba["resets_after"] / ba["days_after"] if ba["days_after"] else 0
+        short = ba["days_after"] < 3
+        rows = [
+            ("Температура CPU, медиана часовых p95", cell(ba["temp_before"], "{} °C"), cell(ba["temp_after"], "{} °C")),
+            ("Жёстких сбросов", f"{ba['resets_before']} за {ba['days_before']:.1f} дн ({rb:.2f}/сут)",
+             f"{ba['resets_after']} за {ba['days_after']:.1f} дн ({ra:.2f}/сут)"),
+        ]
+        html = ("<b>До и после фикса</b><table cellspacing=0 cellpadding=3>"
+                "<tr><td></td><td><i>до</i></td><td>&nbsp;&nbsp;</td><td><i>после</i></td></tr>")
+        for name, b, a in rows:
+            html += f"<tr><td>{name}&nbsp;&nbsp;</td><td>{b}</td><td></td><td><b>{a}</b></td></tr>"
+        html += "</table>"
+        if short:
+            html += ("<small>После фикса прошло меньше 3 дней — по сбросам выводы делать рано: "
+                     "раньше они случались примерно раз в несколько дней.</small>")
+        return html
 
     # ---- helpers
     def _job(self, fn, cb):
@@ -490,7 +628,8 @@ class TrayApp(QObject):
         fix = checks.tests_fix(procs, conts, snap)
         if not self._ask(fix.label, fix.confirm + "\n\nОстановить?"):
             return
-        self._bg(lambda: actions.execute(fix.root_actions, fix.user_cmds, fix.py_action), self._menu_done)
+        self._bg(lambda: actions.execute(fix.root_actions, fix.user_cmds, fix.py_action),
+                 lambda res: self._menu_done(res, "тесты остановлены вручную"))
 
     def swap_menu(self):
         snap = testguard.mem_snapshot()
@@ -507,13 +646,16 @@ class TrayApp(QObject):
                          "Вернуть данные из swap в память, чтобы программы перестали подтормаживать?\n"
                          "Нужен пароль, может занять минуту."):
             return
-        self._bg(lambda: actions.run_root([{"action": "swap-refresh"}]), self._menu_done)
+        self._bg(lambda: actions.run_root([{"action": "swap-refresh"}]),
+                 lambda res: self._menu_done(res, "swap возвращён в память"))
 
-    def _menu_done(self, res):
+    def _menu_done(self, res, event=""):
         if isinstance(res, Exception):
             self._note("Ошибка", str(res), True)
         else:
             ok, log = res
+            if ok and event:
+                log_event("action", event)
             self._note("Готово" if ok else "Есть ошибки", log or "Готово.", not ok)
         self.refresh()
 
@@ -557,6 +699,7 @@ class TrayApp(QObject):
     def _auto_stopped(self, res):
         if res and not isinstance(res, Exception):
             what, _ = res
+            log_event("tests", "тесты остановлены автоматически: кончалась память")
             self.tray.showMessage("Память кончалась — тесты остановлены", what[:400],
                                   QSystemTrayIcon.MessageIcon.Critical, 30000)
         self.refresh()
@@ -567,6 +710,7 @@ class TrayApp(QObject):
             return
         freed, log = res
         if freed:
+            log_event("clean", f"плановая очистка: {human(freed)}")
             self.tray.showMessage(f"Плановая очистка: освобождено {human(freed)}", "\n".join(log)[:400],
                                   QSystemTrayIcon.MessageIcon.Information, 15000)
 

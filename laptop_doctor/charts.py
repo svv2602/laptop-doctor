@@ -9,13 +9,18 @@ import math
 from datetime import date, datetime
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QApplication, QSizePolicy, QToolTip, QWidget
+from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
+from PyQt6.QtWidgets import QApplication, QSizePolicy, QStackedWidget, QToolTip, QWidget
 
-LIGHT = {"surface": "#fcfcfb", "series": "#2a78d6", "ink": "#0b0b0b", "ink2": "#52514e",
+LIGHT = {"surface": "#fcfcfb", "series": "#2a78d6", "series2": "#eb6834", "neutral": "#f0efec",
+         "track": "#cde2fb", "ink": "#0b0b0b", "ink2": "#52514e",
          "muted": "#898781", "grid": "#e1e0d9", "axis": "#c3c2b7"}
-DARK = {"surface": "#1a1a19", "series": "#3987e5", "ink": "#f0efec", "ink2": "#c3c2b7",
+DARK = {"surface": "#1a1a19", "series": "#3987e5", "series2": "#d95926", "neutral": "#383835",
+        "track": "#104281", "ink": "#f0efec", "ink2": "#c3c2b7",
         "muted": "#898781", "grid": "#2c2c2a", "axis": "#383835"}
+
+
+CRITICAL = "#d03b3b"  # статус «критично» — только для жёстких сбросов, всегда с подписью в подсказке
 
 
 def theme() -> dict:
@@ -46,10 +51,14 @@ class _Base(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.hover: int | None = None
+        self._tick_labels: list[str] = []
 
     def plot_rect(self) -> QRectF:
-        return QRectF(self.PAD_L, self.PAD_T, self.width() - self.PAD_L - self.PAD_R,
-                      self.height() - self.PAD_T - self.PAD_B)
+        fm = self.fontMetrics()
+        pad_l = max(self.PAD_L, max((fm.horizontalAdvance(x) for x in self._tick_labels), default=0) + 12)
+        pad_t = max(self.PAD_T, fm.height() + 12)
+        pad_b = max(self.PAD_B, fm.height() + 8)
+        return QRectF(pad_l, pad_t, self.width() - pad_l - self.PAD_R, self.height() - pad_t - pad_b)
 
     def _frame(self, p: QPainter, t: dict) -> None:
         p.fillRect(self.rect(), QColor(t["surface"]))
@@ -57,9 +66,12 @@ class _Base(QWidget):
         f.setBold(True)
         p.setFont(f)
         p.setPen(QColor(t["ink"]))
-        p.drawText(QRectF(8, 4, self.width() - 16, 22), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   self.title)
+        p.drawText(QRectF(8, 4, self.width() - 16, self.fontMetrics().height() + 6),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.title)
         p.setFont(self.font())
+
+    def tick_label(self, v: float) -> str:
+        return f"{v:g}{self.unit}"
 
     def _y_axis(self, p: QPainter, t: dict, ticks: list[float], y_of) -> None:
         r = self.plot_rect()
@@ -68,8 +80,8 @@ class _Base(QWidget):
             p.setPen(QPen(QColor(t["grid"]), 1))
             p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
             p.setPen(QColor(t["muted"]))
-            label = f"{v:g}{self.unit}"
-            p.drawText(QRectF(0, y - 8, self.PAD_L - 6, 16),
+            label = self.tick_label(v)
+            p.drawText(QRectF(0, y - 8, r.left() - 6, 16),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label)
         p.setPen(QPen(QColor(t["axis"]), 1))
         p.drawLine(QPointF(r.left(), r.bottom()), QPointF(r.right(), r.bottom()))
@@ -87,29 +99,43 @@ class _Base(QWidget):
 class LineChart(_Base):
     """Временной ряд. Разрыв линии, если между точками больше gap_s (ноут был выключен)."""
 
+    X_PAD = 10  # отступ данных от левого/правого края области графика — свежая точка не прилипает к рамке
+    Y_PAD = 6
+
     def __init__(self, title: str, unit: str, fmt: str = "{:.0f}", y_min: float | None = 0,
-                 y_max: float | None = None, parent=None):
+                 y_max: float | None = None, min_span: float = 1.0, parent=None):
         super().__init__(title, unit, parent)
-        self.fmt, self.y_min, self.y_max = fmt, y_min, y_max
+        self.fmt, self.y_min, self.y_max, self.min_span = fmt, y_min, y_max, min_span
         self.points: list[tuple[float, float]] = []
+        self.events: list[tuple[float, str, str]] = []   # (время, вид, текст); вид "reset" — красная линия
         self.t0 = self.t1 = 0.0
         self.gap_s = 1800.0
 
-    def set_data(self, points, t0: float, t1: float, gap_s: float):
+    def set_data(self, points, t0: float, t1: float, gap_s: float, events=()):
         self.points, self.t0, self.t1, self.gap_s = sorted(points), t0, t1, gap_s
+        self.events = [e for e in events if t0 <= e[0] <= t1]
         self.hover = None
         self.update()
 
     def _scales(self):
-        r = self.plot_rect()
         vals = [v for _, v in self.points]
-        lo = self.y_min if self.y_min is not None else min(vals)
-        hi = self.y_max if self.y_max is not None else max(vals) * 1.1 or 1
+        vmin, vmax = min(vals), max(vals)
+        lo = self.y_min if self.y_min is not None else vmin - (vmax - vmin) * 0.1
+        if self.y_max is not None:
+            hi = self.y_max
+        else:
+            # запас сверху 15% и минимальный размах: почти пустой swap не растягивается на всю высоту
+            hi = max(vmax + (vmax - lo) * 0.15, lo + self.min_span)
         ticks = nice_ticks(lo, hi)
         lo, hi = min(lo, ticks[0]), max(hi, ticks[-1])
+        self._tick_labels = [self.tick_label(v) for v in ticks]
+        r = self.plot_rect()  # после подписей: отступ слева зависит от их ширины
         span_t = (self.t1 - self.t0) or 1
-        x_of = lambda ts: r.left() + (ts - self.t0) / span_t * r.width()  # noqa: E731
-        y_of = lambda v: r.bottom() - (v - lo) / ((hi - lo) or 1) * r.height()  # noqa: E731
+        left, width = r.left() + self.X_PAD, r.width() - 2 * self.X_PAD
+        x_of = lambda ts: left + (ts - self.t0) / span_t * width  # noqa: E731
+        # отступ по вертикали: значение на пределе шкалы (100%) не сливается с рамкой и не срезается
+        top, height = r.top() + self.Y_PAD, r.height() - 2 * self.Y_PAD
+        y_of = lambda v: top + height - (v - lo) / ((hi - lo) or 1) * height  # noqa: E731
         return ticks, x_of, y_of
 
     def paintEvent(self, _):
@@ -123,18 +149,38 @@ class LineChart(_Base):
         ticks, x_of, y_of = self._scales()
         self._y_axis(p, t, ticks, y_of)
         self._x_axis(p, t, x_of)
-        path, prev = QPainterPath(), None
+        # отрезки между разрывами; одиночную точку рисуем кружком, иначе её не видно
+        segments: list[list[QPointF]] = []
+        prev = None
         for ts, v in self.points:
             pt = QPointF(x_of(ts), y_of(v))
             if prev is None or ts - prev > self.gap_s:
-                path.moveTo(pt)
+                segments.append([pt])
             else:
-                path.lineTo(pt)
+                segments[-1].append(pt)
             prev = ts
+        p.save()
+        p.setClipRect(self.plot_rect().adjusted(-3, -3, 3, 3))
+        r = self.plot_rect()
+        for ts, kind, _ in self.events:  # отметки событий — под линией данных
+            x = x_of(ts)
+            if kind == "reset":
+                p.setPen(QPen(QColor(CRITICAL), 1.5))
+            else:
+                p.setPen(QPen(QColor(t["muted"]), 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
         pen = QPen(QColor(t["series"]), 2)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         p.setPen(pen)
-        p.drawPath(path)
+        for seg in segments:
+            if len(seg) == 1:
+                p.setBrush(QColor(t["series"]))
+                p.drawEllipse(seg[0], 2.5, 2.5)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+            else:
+                p.drawPolyline(seg)
+        p.restore()
         if self.hover is not None:
             ts, v = self.points[self.hover]
             x, y = x_of(ts), y_of(v)
@@ -171,6 +217,13 @@ class LineChart(_Base):
             return
         _, x_of, _ = self._scales()
         mx = e.position().x()
+        near = [ev for ev in self.events if abs(x_of(ev[0]) - mx) <= 4]
+        if near:
+            self.hover = None
+            QToolTip.showText(e.globalPosition().toPoint(), "\n".join(
+                f"{datetime.fromtimestamp(ts):%d.%m %H:%M} — {text}" for ts, _, text in near), self)
+            self.update()
+            return
         i = min(range(len(self.points)), key=lambda k: abs(x_of(self.points[k][0]) - mx))
         if abs(x_of(self.points[i][0]) - mx) > 40:
             self.leaveEvent(e)
@@ -210,6 +263,7 @@ class DayBarChart(_Base):
             return
         hi = max(max(c for _, c in self.days), 2)
         ticks = [v for v in nice_ticks(0, hi, 2) if float(v).is_integer()]
+        self._tick_labels = [self.tick_label(v) for v in ticks]
         r, slot, bw = self._geom()
         y_of = lambda v: r.bottom() - v / (ticks[-1] or 1) * r.height()  # noqa: E731
         self._y_axis(p, t, ticks, y_of)
@@ -246,3 +300,183 @@ class DayBarChart(_Base):
         d, c = self.days[i]
         QToolTip.showText(e.globalPosition().toPoint(), f"{d:%d.%m.%Y}\n{self.title}: {c}", self)
         self.update()
+
+
+# ------------------------------------------------------------------ диаграмма текущего состояния
+
+class SnapshotPanel(QWidget):
+    """Когда истории за период мало: текущее состояние вместо пустого графика.
+
+    Сверху вниз: заголовок, крупная строка-итог, высокая сегментная полоса (часть-целое, ≤ 3 частей,
+    легенда из названий), шкалы-метры (одно отношение к пределу), столбики по убыванию (один цвет).
+    """
+
+    BAR_H = 28       # высокая сегментная полоса — не выше 28px
+    METER_H = 10
+    ROW_H = 18
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.headline = ""
+        self.note = ""
+        self.parts: list[tuple[str, float, str, str]] = []    # (название, значение, ключ цвета, текст)
+        self.meters: list[tuple[str, float, str]] = []         # (название, доля 0..1, текст)
+        self.bars: list[tuple[str, float, str]] = []           # (название, значение, текст)
+        self.bars_title = ""
+        self._hits: list[tuple[QRectF, str]] = []
+        self.setMinimumHeight(190)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+
+    def set_data(self, headline="", parts=(), meters=(), bars=(), bars_title="", note=""):
+        self.headline, self.note, self.bars_title = headline, note, bars_title
+        self.parts, self.meters, self.bars = list(parts), list(meters), list(bars)
+        self.update()
+
+    def paintEvent(self, _):
+        t = theme()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(t["surface"]))
+        fm = self.fontMetrics()
+        lh = fm.height()
+        x0, w = 8.0, self.width() - 16.0
+        y = 4.0
+        bold = QFont(self.font())
+        bold.setBold(True)
+        p.setFont(bold)
+        p.setPen(QColor(t["ink"]))
+        p.drawText(QRectF(x0, y, w, lh + 6), Qt.AlignmentFlag.AlignVCenter, self.title)
+        p.setFont(self.font())
+        y += lh + 10
+        self._hits = []
+        if self.headline:
+            big = QFont(self.font())
+            big.setPointSizeF(self.font().pointSizeF() * 1.5)
+            p.setFont(big)
+            p.setPen(QColor(t["ink"]))
+            bh = QFontMetricsF(big).height()
+            p.drawText(QRectF(x0, y, w, bh), Qt.AlignmentFlag.AlignVCenter, self.headline)
+            p.setFont(self.font())
+            y += bh + 8
+        if self.parts:
+            y = self._segmented(p, t, x0, y, w, lh)
+        for name, frac, text in self.meters:
+            y = self._meter(p, t, x0, y, w, lh, name, frac, text)
+        if self.bars:
+            y = self._ranked(p, t, x0, y, w, lh)
+        if self.note:
+            p.setPen(QColor(t["muted"]))
+            nr = self._note_rect(w)
+            p.drawText(nr, Qt.AlignmentFlag.AlignBottom | Qt.TextFlag.TextWordWrap, self.note)
+
+    def _note_rect(self, w: float) -> QRectF:
+        """Подпись внизу с переносом строк; столбики не заходят на неё."""
+        if not self.note:
+            return QRectF(8, self.height(), w, 0)
+        br = self.fontMetrics().boundingRect(0, 0, int(w), 1000, int(Qt.TextFlag.TextWordWrap), self.note)
+        return QRectF(8, self.height() - br.height() - 6, w, br.height())
+
+    def _segmented(self, p, t, x0, y, w, lh):
+        total = sum(v for _, v, _, _ in self.parts) or 1
+        x = x0
+        gap = 2.0  # зазор цвета фона между частями
+        visible = [part for part in self.parts if part[1] > 0]
+        for i, (name, v, key, text) in enumerate(visible):
+            seg_w = max(v / total * (w - gap * (len(visible) - 1)), 1)
+            rect = QRectF(x, y, seg_w, self.BAR_H)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(t[key]))
+            p.drawRoundedRect(rect, 4, 4)
+            share = f"{v / total * 100:.0f}%"
+            ink = "#0b0b0b" if key == "neutral" and t is LIGHT else ("#f0efec" if key == "neutral" else "#ffffff")
+            if self.fontMetrics().horizontalAdvance(share) + 12 < seg_w:
+                p.setPen(QColor(ink))
+                p.drawText(rect.adjusted(6, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, share)
+            self._hits.append((rect, f"{name}: {text} ({share})"))
+            x += seg_w + gap
+        y += self.BAR_H + 6
+        # легенда: только названия, в порядке частей
+        lx = x0
+        for name, v, key, _ in visible:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(t[key]))
+            p.drawRoundedRect(QRectF(lx, y + lh / 2 - 5, 10, 10), 2, 2)
+            p.setPen(QColor(t["ink2"]))
+            tw = self.fontMetrics().horizontalAdvance(name)
+            p.drawText(QRectF(lx + 14, y, tw + 4, lh), Qt.AlignmentFlag.AlignVCenter, name)
+            lx += 14 + tw + 18
+        return y + lh + 10
+
+    def _meter(self, p, t, x0, y, w, lh, name, frac, text):
+        p.setPen(QColor(t["ink2"]))
+        p.drawText(QRectF(x0, y, w, lh), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+        p.setPen(QColor(t["ink"]))
+        p.drawText(QRectF(x0, y, w, lh), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, text)
+        y += lh + 3
+        track = QRectF(x0, y, w, self.METER_H)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(t["track"]))
+        p.drawRoundedRect(track, self.METER_H / 2, self.METER_H / 2)
+        frac = max(0.0, min(1.0, frac))
+        if frac > 0:
+            p.setBrush(QColor(t["series"]))
+            p.drawRoundedRect(QRectF(x0, y, max(w * frac, self.METER_H), self.METER_H), self.METER_H / 2, self.METER_H / 2)
+        self._hits.append((track, f"{name}: {text}"))
+        return y + self.METER_H + 10
+
+    def _ranked(self, p, t, x0, y, w, lh):
+        if self.bars_title:
+            p.setPen(QColor(t["ink2"]))
+            p.drawText(QRectF(x0, y, w, lh), Qt.AlignmentFlag.AlignVCenter, self.bars_title)
+            y += lh + 4
+        fm = self.fontMetrics()
+        name_w = min(max(fm.horizontalAdvance(n) for n, _, _ in self.bars) + 10, w * 0.4)
+        val_w = max(fm.horizontalAdvance(tx) for _, _, tx in self.bars) + 8
+        vmax = max(v for _, v, _ in self.bars) or 1
+        row = max(lh, self.ROW_H) + 4
+        for name, v, text in self.bars:
+            if y + row > self._note_rect(w).top() - 2:
+                break
+            p.setPen(QColor(t["ink2"]))
+            p.drawText(QRectF(x0, y, name_w - 6, row), Qt.AlignmentFlag.AlignVCenter,
+                       fm.elidedText(name, Qt.TextElideMode.ElideRight, int(name_w - 6)))
+            bw = max((w - name_w - val_w) * v / vmax, 2)
+            rect = QRectF(x0 + name_w, y + (row - 12) / 2, bw, 12)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(t["series"]))
+            p.drawRoundedRect(rect, 3, 3)
+            p.setPen(QColor(t["ink"]))
+            p.drawText(QRectF(rect.right() + 6, y, val_w, row), Qt.AlignmentFlag.AlignVCenter, text)
+            self._hits.append((QRectF(x0, y, w, row), f"{name}: {text}"))
+            y += row
+        return y + 4
+
+    def mouseMoveEvent(self, e):
+        pos = e.position()
+        for rect, tip in self._hits:
+            if rect.contains(pos):
+                QToolTip.showText(e.globalPosition().toPoint(), tip, self)
+                return
+        QToolTip.hideText()
+
+
+class ChartSlot(QStackedWidget):
+    """Ячейка сетки: график, а пока истории мало — диаграмма текущего состояния."""
+
+    def __init__(self, chart: QWidget, snapshot: SnapshotPanel | None, parent=None):
+        super().__init__(parent)
+        self.chart, self.snapshot = chart, snapshot
+        self.addWidget(chart)
+        if snapshot is not None:
+            self.addWidget(snapshot)
+        self.setMinimumHeight(300 if snapshot is not None else 240)
+
+    def show_chart(self, points, t0, t1, gap_s, events=()):
+        self.chart.set_data(points, t0, t1, gap_s, events)
+        self.setCurrentWidget(self.chart)
+
+    def show_snapshot(self):
+        if self.snapshot is not None:
+            self.setCurrentWidget(self.snapshot)
