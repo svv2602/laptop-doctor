@@ -26,6 +26,22 @@ class Config:
     mem_warn_available_pct: int = 10
     swap_warn_used_pct: int = 50
     mem_pressure_warn_pct: float = 5.0
+    # Критично (быстрый сторож шлёт уведомление сразу): доступно < N% или PSI avg10 >= N%
+    mem_critical_available_pct: int = 5
+    mem_critical_pressure_pct: float = 20.0
+    # Как часто быстрый сторож смотрит на память, секунд (только /proc, почти бесплатно)
+    mem_watch_interval_s: int = 15
+    # Тесты: процессы (регулярки по командной строке) и контейнеры (префикс имени / регулярка по образу)
+    test_process_patterns: list[str] = field(default_factory=lambda: [
+        r"phpunit", r"paratest", r"\bpest\b", r"\bpytest\b", r"vitest", r"\bjest\b",
+        r"playwright", r"flutter_tester", r"\brspec\b",
+    ])
+    test_container_prefixes: list[str] = field(default_factory=list)
+    test_container_images: list[str] = field(default_factory=list)
+    # Тест, идущий дольше N минут, считается подозрительным (завис?)
+    test_max_minutes: int = 30
+    # Автоматически останавливать тесты при критической нехватке памяти
+    auto_stop_tests_on_memory_critical: bool = False
     journal_warn_mb: int = 1024
     boot_userspace_warn_s: float = 15.0
     docker_cpu_warn_pct: float = 25.0

@@ -7,6 +7,7 @@ from datetime import datetime
 
 import os
 import subprocess
+import time
 
 from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap
@@ -17,7 +18,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import actions, checks, cleanup
+from . import actions, checks, cleanup, testguard
 from .checks import STATUS_LABEL, CheckResult, Status
 from .config import CONFIG_PATH, Config
 from .util import human
@@ -188,7 +189,7 @@ class MainWindow(QMainWindow):
             return
         fix = r.fix
         self.fix_btn.setEnabled(False)
-        self._job(lambda: actions.execute(fix.root_actions, fix.user_cmds), self._fix_done)
+        self._job(lambda: actions.execute(fix.root_actions, fix.user_cmds, fix.py_action), self._fix_done)
 
     def _fix_done(self, res):
         self.fix_btn.setEnabled(True)
@@ -322,9 +323,10 @@ class MainWindow(QMainWindow):
     def _job(self, fn, cb):
         w = Worker(fn, self)
         w.done.connect(cb)
-        w.finished.connect(w.deleteLater)
+        jobs = self.__dict__.setdefault("_jobs", [])
+        jobs.append(w)  # держим ссылку, пока поток работает
+        w.finished.connect(lambda: jobs.remove(w) if w in jobs else None)
         w.start()
-        self._jobs = [*getattr(self, "_jobs", []), w]
 
     def _report(self, res):
         if isinstance(res, Exception):
@@ -354,17 +356,95 @@ class TrayApp(QObject):
         a_open = QAction("Открыть", menu, triggered=self.show_window)
         a_check = QAction("Проверить сейчас", menu, triggered=self.refresh)
         a_quit = QAction("Выход", menu, triggered=qapp.quit)
+        a_tests = QAction("Остановить тесты…", menu, triggered=self.stop_tests_menu)
+        a_swap = QAction("Вернуть swap в память…", menu, triggered=self.swap_menu)
         menu.addActions([a_open, a_check])
         menu.addSeparator()
+        menu.addActions([a_tests, a_swap])
+        menu.addSeparator()
         menu.addAction(a_quit)
+        self.menu = menu  # держим ссылку, иначе меню соберёт сборщик мусора
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._activated)
+        self.tray.messageClicked.connect(self.show_window)
         self.tray.show()
 
         self.window = MainWindow(self)
         self.timer = QTimer(self, interval=max(1, self.cfg.check_interval_min) * 60_000, timeout=self.refresh)
         self.timer.start()
         QTimer.singleShot(1500, self.refresh)
+
+        # Быстрый сторож памяти: только /proc, раз в несколько секунд. При нехватке — сразу полная
+        # проверка (она пришлёт уведомление), не чаще раза в минуту; при критической — опционально
+        # автоматическая остановка тестов.
+        self.last_mem_alert = 0.0
+        self.auto_stop_job: Worker | None = None
+        self.mem_timer = QTimer(self, interval=max(5, self.cfg.mem_watch_interval_s) * 1000,
+                                timeout=self._watch_memory)
+        self.mem_timer.start()
+
+    # ---- пункты меню трея: доступны всегда
+
+    def _bg(self, fn, cb):
+        w = Worker(fn, self)
+        w.done.connect(cb)
+        jobs = self.__dict__.setdefault("_bg_jobs", [])
+        jobs.append(w)  # держим ссылку, пока поток работает
+        w.finished.connect(lambda: jobs.remove(w) if w in jobs else None)
+        w.start()
+
+    def _note(self, title: str, text: str, critical: bool = False):
+        icon = QSystemTrayIcon.MessageIcon.Warning if critical else QSystemTrayIcon.MessageIcon.Information
+        self.tray.showMessage(title, text, icon, 10000)
+
+    def _ask(self, title: str, text: str) -> bool:
+        box = QMessageBox(QMessageBox.Icon.Question, title, text,
+                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def stop_tests_menu(self):
+        self._note("Тесты", "Ищу запущенные тесты…")
+        self._bg(lambda: (testguard.find_test_processes(self.cfg), testguard.find_test_containers(self.cfg),
+                          testguard.mem_snapshot()), self._stop_tests_found)
+
+    def _stop_tests_found(self, res):
+        if isinstance(res, Exception):
+            self._note("Тесты", f"Ошибка поиска: {res}", True)
+            return
+        procs, conts, snap = res
+        if not procs and not conts:
+            self._note("Тесты", "Тесты не запущены — останавливать нечего.")
+            return
+        fix = checks.tests_fix(procs, conts, snap)
+        if not self._ask(fix.label, fix.confirm + "\n\nОстановить?"):
+            return
+        self._bg(lambda: actions.execute(fix.root_actions, fix.user_cmds, fix.py_action), self._menu_done)
+
+    def swap_menu(self):
+        snap = testguard.mem_snapshot()
+        used_mb = snap.swap_used // 1024 ** 2
+        if snap.swap_used < 64 * 1024 ** 2:
+            self._note("Swap", f"Swap почти пуст ({used_mb} МБ) — возвращать нечего.")
+            return
+        if snap.available < snap.swap_used + 2 * 1024 ** 3:
+            self._note("Swap", f"В swap {used_mb} МБ, а свободной памяти {snap.available // 1024 ** 2} МБ — "
+                       "не поместится с запасом 2 ГБ. Сначала остановите тесты или закройте тяжёлые программы.", True)
+            return
+        if not self._ask("Вернуть swap в память",
+                         f"В swap {used_mb} МБ, свободной памяти {snap.available // 1024 ** 2} МБ.\n"
+                         "Вернуть данные из swap в память, чтобы программы перестали подтормаживать?\n"
+                         "Нужен пароль, может занять минуту."):
+            return
+        self._bg(lambda: actions.run_root([{"action": "swap-refresh"}]), self._menu_done)
+
+    def _menu_done(self, res):
+        if isinstance(res, Exception):
+            self._note("Ошибка", str(res), True)
+        else:
+            ok, log = res
+            self._note("Готово" if ok else "Есть ошибки", log or "Готово.", not ok)
+        self.refresh()
 
     def _activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -377,6 +457,38 @@ class TrayApp(QObject):
         self.window.show()
         self.window.raise_()
         self.window.activateWindow()
+
+    def _watch_memory(self):
+        snap = testguard.mem_snapshot()
+        if not testguard.memory_low(snap, self.cfg):
+            return
+        now = time.monotonic()
+        if now - self.last_mem_alert < 60:
+            return
+        self.last_mem_alert = now
+        if (self.cfg.auto_stop_tests_on_memory_critical and testguard.memory_critical(snap, self.cfg)
+                and not (self.auto_stop_job and self.auto_stop_job.isRunning())):
+            self.auto_stop_job = Worker(lambda: self._auto_stop(snap), self)
+            self.auto_stop_job.done.connect(self._auto_stopped)
+            self.auto_stop_job.start()
+        else:
+            self.refresh()
+
+    def _auto_stop(self, snap):
+        procs = testguard.find_test_processes(self.cfg)
+        conts = testguard.find_test_containers(self.cfg)
+        if not procs and not conts:
+            return None
+        what = testguard.describe(procs, conts)
+        log = testguard.stop_tests(procs, conts)
+        return what, log
+
+    def _auto_stopped(self, res):
+        if res and not isinstance(res, Exception):
+            what, _ = res
+            self.tray.showMessage("Память кончалась — тесты остановлены", what[:400],
+                                  QSystemTrayIcon.MessageIcon.Critical, 30000)
+        self.refresh()
 
     def refresh(self):
         if self.worker and self.worker.isRunning():

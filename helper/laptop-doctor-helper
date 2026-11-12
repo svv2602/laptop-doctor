@@ -130,6 +130,31 @@ def clean_crash(a):
     return f"удалено отчётов: {n}"
 
 
+def meminfo_bytes():
+    mi = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        m = re.match(r"(\w+):\s+(\d+)", line)
+        if m:
+            mi[m.group(1)] = int(m.group(2)) * 1024
+    return mi
+
+
+def swap_refresh(a):
+    """Вернуть данные из swap в RAM (swapoff+swapon), только если они точно помещаются."""
+    mi = meminfo_bytes()
+    used = mi.get("SwapTotal", 0) - mi.get("SwapFree", 0)
+    avail = mi.get("MemAvailable", 0)
+    margin = 2 * 1024 ** 3
+    if used < 64 * 1024 ** 2:
+        return "swap почти пуст — обновлять нечего"
+    if avail < used + margin:
+        raise RuntimeError(f"не хватит памяти: в swap {used // 1024 ** 2} МБ, доступно {avail // 1024 ** 2} МБ "
+                           "(нужен запас 2 ГБ) — сначала закройте что-нибудь тяжёлое")
+    sh(["swapoff", "-a"], timeout=1800)
+    sh(["swapon", "-a"])
+    return f"swap обновлён: {used // 1024 ** 2} МБ возвращено в память"
+
+
 ACTIONS = {
     "set-battery-threshold": set_battery_threshold,
     "arc-autosuspend": arc_autosuspend,
@@ -140,6 +165,7 @@ ACTIONS = {
     "remove-snap-revisions": remove_snap_revisions,
     "apt-autoremove": apt_autoremove,
     "clean-crash": clean_crash,
+    "swap-refresh": swap_refresh,
 }
 
 

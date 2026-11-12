@@ -34,6 +34,8 @@ class Fix:
     root_actions: list[dict] = field(default_factory=list)
     # Команды от пользователя
     user_cmds: list[list[str]] = field(default_factory=list)
+    # Действие внутри программы (выполняется до root-действий), возвращает строки лога
+    py_action: Callable[[], list[str]] | None = None
 
 
 @dataclass
@@ -490,10 +492,61 @@ def check_memory(cfg: Config) -> CheckResult:
     if kills:
         details += "\n\nУбийства из-за нехватки памяти:\n" + "\n".join(kills[-8:])
 
+    from . import testguard
+    snap = testguard.mem_snapshot()
+    fix = None
+    if problems:
+        procs, conts = testguard.find_test_processes(cfg), testguard.find_test_containers(cfg)
+        if procs or conts:
+            fix = tests_fix(procs, conts, snap)
+            details += "\n\nЗапущены тесты — возможно, это они:\n" + testguard.describe(procs, conts)
+    if fix is None and testguard.swap_refresh_wanted(snap):
+        fix = Fix("Вернуть swap в память",
+                  f"В swap {human(sw_used)}, а в памяти достаточно места. Вернуть данные из swap в память, "
+                  "чтобы программы перестали подтормаживать? (нужен пароль, может занять минуту)",
+                  root_actions=[{"action": "swap-refresh"}])
     if problems:
         status = Status.ERROR if kills or psi >= cfg.mem_pressure_warn_pct * 3 else Status.WARN
-        return CheckResult("memory", "Память и swap", status, summary + " — " + "; ".join(problems), details)
-    return CheckResult("memory", "Память и swap", Status.OK, summary, details)
+        return CheckResult("memory", "Память и swap", status, summary + " — " + "; ".join(problems), details, fix)
+    return CheckResult("memory", "Память и swap", Status.OK, summary, details, fix)
+
+
+def tests_fix(procs, conts, snap) -> Fix:
+    from . import testguard
+    swap = testguard.swap_refresh_wanted_after(snap, procs, conts)
+    what = testguard.describe(procs, conts)
+    return Fix("Остановить тесты и освободить память",
+               "Будут остановлены:\n" + what +
+               ("\n\nЗатем данные из swap вернутся в память, чтобы система перестала тормозить "
+                "(нужен пароль, может занять минуту)." if swap else ""),
+               root_actions=[{"action": "swap-refresh"}] if swap else [],
+               py_action=lambda: testguard.stop_tests(procs, conts))
+
+
+def check_tests(cfg: Config) -> CheckResult:
+    from . import testguard
+    from .util import human
+    title = "Тесты"
+    procs, conts = testguard.find_test_processes(cfg), testguard.find_test_containers(cfg)
+    snap = testguard.mem_snapshot()
+    watched = ("Ищу процессы: " + ", ".join(cfg.test_process_patterns) +
+               "\nКонтейнеры: префиксы " + (", ".join(cfg.test_container_prefixes) or "—") +
+               "; образы " + (", ".join(cfg.test_container_images) or "—"))
+    if not procs and not conts:
+        return CheckResult("tests", title, Status.OK, "Не запущены", watched)
+    total = sum(p.rss for p in procs) + sum(c.mem for c in conts)
+    limit = cfg.test_max_minutes * 60
+    stuck = [p for p in procs if p.age_s > limit] + [c for c in conts if c.age_s > limit]
+    low = testguard.memory_low(snap, cfg)
+    summary = f"Запущено: {len(conts)} контейнер(ов), {len(procs)} процесс(ов), {human(total)} памяти"
+    details = testguard.describe(procs, conts) + "\n\n" + watched
+    fix = tests_fix(procs, conts, snap)
+    if low:
+        return CheckResult("tests", title, Status.ERROR, summary + " — не хватает памяти", details, fix)
+    if stuck:
+        return CheckResult("tests", title, Status.WARN,
+                           summary + f" — {len(stuck)} идут дольше {cfg.test_max_minutes} мин (зависли?)", details, fix)
+    return CheckResult("tests", title, Status.INFO, summary, details, fix)
 
 
 def parse_journal_mb(out: str) -> float | None:
@@ -526,7 +579,7 @@ CHECKS: list[Callable[[Config], CheckResult]] = [
     check_resets, check_dgpu, check_temps, check_battery,
     check_docker_loops, check_docker_cpu, check_abandoned,
     check_failed, check_reenabled,
-    check_memory, check_disk, check_journal, check_boot, check_power, check_reboot_required,
+    check_memory, check_tests, check_disk, check_journal, check_boot, check_power, check_reboot_required,
 ]
 
 

@@ -129,7 +129,8 @@ def test_helper_rejects_unknown_action(helper):
     assert "clean-docker-volumes" not in helper.ACTIONS
     assert set(helper.ACTIONS) == {
         "set-battery-threshold", "arc-autosuspend", "disable-units", "restart-units",
-        "fix-remmina-socket", "journal-limit", "remove-snap-revisions", "apt-autoremove", "clean-crash"}
+        "fix-remmina-socket", "journal-limit", "remove-snap-revisions", "apt-autoremove", "clean-crash",
+        "swap-refresh"}
 
 
 def test_unit_label():
@@ -170,8 +171,101 @@ def test_memory_status(monkeypatch):
     monkeypatch.setattr(checks, "read", lambda p, d=None: files.get(str(p), d))
     monkeypatch.setattr(checks, "top_memory", lambda n=10: [(5 * 1024 ** 3, "chrome", 30)])
     monkeypatch.setattr(checks, "oom_kills", lambda days=7: [])
+    from laptop_doctor import testguard
+    monkeypatch.setattr(testguard, "find_test_processes", lambda cfg: [])
+    monkeypatch.setattr(testguard, "find_test_containers", lambda cfg: [])
+    monkeypatch.setattr(testguard, "mem_snapshot", lambda: testguard.MemSnapshot(1, 1, 0, 0, 0, 0))
     r = checks.check_memory(Config())
     assert r.status == checks.Status.WARN  # доступно 6% и swap 69%
     assert "swap занят на 69%" in r.summary and "chrome (30 проц.)" in r.details
     monkeypatch.setattr(checks, "oom_kills", lambda days=7: ["kernel: Out of memory: Killed process 1 (x)"])
     assert checks.check_memory(Config()).status == checks.Status.ERROR
+
+
+# ---------------------------------------------------------------- testguard
+
+import os as _os
+import subprocess as _sp
+import sys as _sys
+
+from laptop_doctor import testguard
+
+
+def test_find_test_processes_filters(monkeypatch):
+    from laptop_doctor.config import Config
+    uid = _os.getuid()
+    ps = "\n".join([
+        f"  101 {uid}  4000  204800 php vendor/bin/phpunit --testsuite unit",
+        f"  102 {uid}    10   1024 /bin/bash -c grep phpunit foo",           # шелл, упоминающий шаблон
+        f"  103 0      4000  204800 php vendor/bin/phpunit",                  # чужой (root)
+        f"  104 {uid}    20   2048 python3 -m pytest -x tests",
+        f"  105 {uid}    20   2048 /usr/bin/python3 -m laptop_doctor",
+        f"  106 {uid}    20   2048 code --type=renderer",
+    ])
+    monkeypatch.setattr(testguard, "run", lambda cmd, **kw: ps)
+    got = testguard.find_test_processes(Config())
+    assert [p.pid for p in got] == [101, 104]
+    assert got[0].rss == 204800 * 1024 and got[0].age_s == 4000
+
+
+def test_age_from_iso():
+    assert testguard._age_from_iso("2000-01-01T00:00:00.123456789Z") > 10 ** 8
+    assert testguard._age_from_iso("garbage") == 0
+
+
+def test_swap_refresh_wanted():
+    g = 1024 ** 3
+    assert not testguard.swap_refresh_wanted(testguard.MemSnapshot(32 * g, 20 * g, 32 * g, g // 2, 0, 0))
+    assert testguard.swap_refresh_wanted(testguard.MemSnapshot(32 * g, 20 * g, 32 * g, 5 * g, 0, 0))
+    assert not testguard.swap_refresh_wanted(testguard.MemSnapshot(32 * g, 6 * g, 32 * g, 5 * g, 0, 0))
+    # после остановки тестов освободится 10 ГБ — тогда хватит
+    snap = testguard.MemSnapshot(32 * g, 6 * g, 32 * g, 5 * g, 0, 0)
+    procs = [testguard.TestProc(1, 0, 10 * g, "phpunit")]
+    assert testguard.swap_refresh_wanted_after(snap, procs, [])
+
+
+def test_stop_tests_kills_stubborn_process():
+    code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    obedient = _sp.Popen([_sys.executable, "-c", "import time; time.sleep(60)"])
+    stubborn = _sp.Popen([_sys.executable, "-c", code])
+    import time
+    time.sleep(0.3)  # успеть поставить обработчик сигнала
+    log = testguard.stop_tests([testguard.TestProc(obedient.pid, 0, 0, "x"),
+                                testguard.TestProc(stubborn.pid, 0, 0, "y")], [])
+    assert obedient.wait(timeout=5) == -15  # SIGTERM
+    assert stubborn.wait(timeout=5) == -9   # не послушался — SIGKILL
+    assert "принудительно: 1" in log[0]
+
+
+def test_check_tests_statuses(monkeypatch):
+    from laptop_doctor.config import Config
+    g = 1024 ** 3
+    cfg = Config()
+    monkeypatch.setattr(testguard, "find_test_containers", lambda c: [])
+    monkeypatch.setattr(testguard, "mem_snapshot", lambda: testguard.MemSnapshot(32 * g, 20 * g, 0, 0, 0, 0))
+    monkeypatch.setattr(testguard, "find_test_processes", lambda c: [])
+    assert checks.check_tests(cfg).status == checks.Status.OK
+    monkeypatch.setattr(testguard, "find_test_processes",
+                        lambda c: [testguard.TestProc(1, 60, g, "phpunit")])
+    r = checks.check_tests(cfg)
+    assert r.status == checks.Status.INFO and r.fix and r.fix.py_action
+    monkeypatch.setattr(testguard, "find_test_processes",
+                        lambda c: [testguard.TestProc(1, 3 * 3600, g, "phpunit")])
+    assert checks.check_tests(cfg).status == checks.Status.WARN
+    monkeypatch.setattr(testguard, "mem_snapshot", lambda: testguard.MemSnapshot(32 * g, g, 0, 0, 30, 30))
+    assert checks.check_tests(cfg).status == checks.Status.ERROR
+
+
+def test_helper_swap_refresh_refuses_without_room(helper, monkeypatch):
+    g = 1024 ** 3
+    calls = []
+    monkeypatch.setattr(helper, "sh", lambda cmd, **kw: calls.append(cmd) or "")
+    monkeypatch.setattr(helper, "meminfo_bytes",
+                        lambda: {"SwapTotal": 32 * g, "SwapFree": 22 * g, "MemAvailable": 11 * g})
+    with pytest.raises(RuntimeError, match="не хватит памяти"):
+        helper.swap_refresh({})
+    assert calls == []  # swapoff не вызывался
+    monkeypatch.setattr(helper, "meminfo_bytes",
+                        lambda: {"SwapTotal": 32 * g, "SwapFree": 22 * g, "MemAvailable": 20 * g})
+    helper.swap_refresh({})
+    assert calls == [["swapoff", "-a"], ["swapon", "-a"]]
