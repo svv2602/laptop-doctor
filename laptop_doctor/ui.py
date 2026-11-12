@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 
 import os
 import subprocess
@@ -13,16 +14,17 @@ from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSign
 from PyQt6.QtGui import QAction, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
-    QComboBox, QGridLayout, QScrollArea,
+    QComboBox, QFileDialog, QGridLayout, QScrollArea,
     QAbstractItemView, QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import actions, checks, cleanup, history, testguard
+from . import actions, checks, cleanup, history, postmortem, report, snooze, state, testguard
 from .charts import ChartSlot, DayBarChart, LineChart, SnapshotPanel
 from .checks import STATUS_LABEL, CheckResult, Status
-from .config import CONFIG_PATH, Config
+from .config import Config
+from .settings_ui import SettingsDialog
 from .history import log_event
 from .util import human
 
@@ -116,10 +118,12 @@ class MainWindow(QMainWindow):
         self.refresh_btn.clicked.connect(self.app.refresh)
         self.updated_lbl = QLabel("—")
         cfg_btn = QPushButton("Настройки…")
-        cfg_btn.setToolTip(str(CONFIG_PATH))
-        cfg_btn.clicked.connect(lambda: subprocess.Popen(["xdg-open", str(CONFIG_PATH)]))
+        cfg_btn.clicked.connect(self.open_settings)
+        export_btn = QPushButton("Экспорт отчёта…")
+        export_btn.clicked.connect(self.export_report)
         top.addWidget(self.refresh_btn)
         top.addWidget(self.updated_lbl, 1)
+        top.addWidget(export_btn)
         top.addWidget(cfg_btn)
         lay.addLayout(top)
 
@@ -141,6 +145,18 @@ class MainWindow(QMainWindow):
         self.fix_btn.clicked.connect(self._run_fix)
         rl.addWidget(self.details, 1)
         rl.addWidget(self.fix_btn)
+        # отложить проблему: не красит значок и не присылает уведомления
+        snooze_row = QHBoxLayout()
+        self.snooze_week = QPushButton("Отложить на 7 дней")
+        self.snooze_same = QPushButton("Не показывать, пока не изменится")
+        self.unsnooze_btn = QPushButton("Вернуть")
+        self.snooze_week.clicked.connect(lambda: self._snooze(days=7))
+        self.snooze_same.clicked.connect(lambda: self._snooze(same=True))
+        self.unsnooze_btn.clicked.connect(self._unsnooze)
+        for b in (self.snooze_week, self.snooze_same, self.unsnooze_btn):
+            b.setVisible(False)
+            snooze_row.addWidget(b)
+        rl.addLayout(snooze_row)
         split.addWidget(right)
         split.setSizes([560, 540])
         lay.addWidget(split, 1)
@@ -152,11 +168,16 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         bold = QFont()
         bold.setBold(True)
-        for r in sorted(results, key=lambda r: -r.status):
-            it = QTreeWidgetItem([STATUS_LABEL[r.status], r.title, r.summary])
-            it.setIcon(0, status_icon(r.status, 32))
+        muted = self.palette().color(self.palette().ColorRole.PlaceholderText)
+        for r in sorted(results, key=lambda r: (r.snoozed, -r.status)):
+            label = "Отложено" if r.snoozed else STATUS_LABEL[r.status]
+            it = QTreeWidgetItem([label, r.title, r.summary])
+            it.setIcon(0, status_icon(Status.INFO if r.snoozed else r.status, 32))
             it.setData(0, Qt.ItemDataRole.UserRole, r.id)
-            if r.status >= Status.WARN:
+            if r.snoozed:
+                for c in range(3):
+                    it.setForeground(c, muted)
+            elif r.status >= Status.WARN:
                 for c in range(3):
                     it.setFont(c, bold)
             self.tree.addTopLevelItem(it)
@@ -181,10 +202,68 @@ class MainWindow(QMainWindow):
             self.details.clear()
             self.fix_btn.setVisible(False)
             return
-        self.details.setPlainText(f"{r.title}: {r.summary}\n\n{r.details}".rstrip())
+        head = f"{r.title}: {r.summary}"
+        if r.snoozed:
+            head += f"\n({snooze.describe(r.id)} — значок и уведомления это не учитывают)"
+        self.details.setPlainText(f"{head}\n\n{r.details}".rstrip())
         self.fix_btn.setVisible(r.fix is not None)
+        problem = r.status >= Status.WARN
+        self.snooze_week.setVisible(problem and not r.snoozed)
+        self.snooze_same.setVisible(problem and not r.snoozed)
+        self.unsnooze_btn.setVisible(r.snoozed)
         if r.fix:
             self.fix_btn.setText(r.fix.label + ("  🔒" if r.fix.root_actions else ""))
+
+    def export_report(self):
+        default = Path.home() / f"laptop-doctor-report-{datetime.now():%Y%m%d-%H%M}.md"
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить отчёт", str(default), "Markdown (*.md)")
+        if not path:
+            return
+        cfg = self.app.cfg
+        results = self.results
+
+        def build():
+            boots = checks.finished_boots()
+            fix_ts = datetime.fromisoformat(cfg.fix_applied_since).timestamp() if cfg.fix_applied_since else 0
+            reports = postmortem.list_reports()
+            text = report.build(results, history.before_after(fix_ts, boots), reports[0] if reports else None)
+            Path(path).write_text(text)
+            return path
+
+        def done(res):
+            if isinstance(res, Exception):
+                QMessageBox.warning(self, "Отчёт", f"Не удалось сохранить: {res}")
+                return
+            QMessageBox.information(self, "Отчёт", f"Сохранён:\n{res}\n\nВ нём могут быть имена ваших проектов "
+                                    "и файлов — проверьте перед отправкой.")
+            subprocess.Popen(["xdg-open", res], start_new_session=True)
+
+        self._job(build, done)
+
+    def open_settings(self):
+        dlg = SettingsDialog(self.app.cfg, self)
+        if dlg.exec():
+            self.app.apply_config()
+
+    def _snooze(self, days=None, same=False):
+        r = self._current()
+        if not r:
+            return
+        snooze.snooze(r.id, days=days, summary=r.summary if same else None)
+        self._resnooze()
+
+    def _unsnooze(self):
+        r = self._current()
+        if r:
+            snooze.unsnooze(r.id)
+            self._resnooze()
+
+    def _resnooze(self):
+        # пересчитать без новой проверки: отметки, значок, подсказку
+        self.app.apply_snoozes(self.results)
+        self.app.update_tray(self.results)
+        self.set_results(self.results)
+        self._show_details()
 
     def _run_fix(self):
         r = self._current()
@@ -367,6 +446,8 @@ class MainWindow(QMainWindow):
             "swap": ChartSlot(LineChart("Занято swap", " ГБ", fmt="{:.2f}", min_span=1), SnapshotPanel("Swap сейчас")),
             "disk": ChartSlot(LineChart("Свободно на диске", " ГБ", min_span=20), SnapshotPanel("Диск сейчас")),
             "battery": ChartSlot(LineChart("Заряд батареи", "%", y_max=100), None),
+            "bat_health": ChartSlot(LineChart("Ёмкость батареи, % от паспортной", "%", fmt="{:.1f}", y_min=None,
+                                              min_span=5), SnapshotPanel("Ёмкость батареи сейчас")),
         }
         for i, sl in enumerate(self.slots.values()):
             row, col = 1 + i // 2, i % 2
@@ -433,6 +514,9 @@ class MainWindow(QMainWindow):
         own(sl["disk"], history.series(rows, "disk_free_gb"), lambda p: self._snap_disk(p, snap))
         own(sl["throttle"], history.throttle_series(rows), lambda p: self._snap_throttle(p, snap))
         own(sl["ssd"], history.series(rows, "ssd_temp"), lambda p: self._snap_ssd(p, snap))
+        blog = history.load_battery()
+        own(sl["bat_health"], [(r["ts"], r["health_pct"]) for r in blog if r["ts"] >= t0],
+            lambda p: self._snap_bat_health(p, blog))
         self.before_after.setText(self._before_after_html(res["before_after"]))
         first = min((r["ts"] for r in rows), default=None)
         note = ("Наведите на график, чтобы увидеть значение; разрывы линий — ноутбук был выключен. "
@@ -496,6 +580,15 @@ class MainWindow(QMainWindow):
         p.set_data(headline=f"{temp}°C" if temp is not None else "Нет данных",
                    meters=[(f"До критической {crit}°C", (temp or 0) / crit, f"{temp}°C из {crit}°C")],
                    bars=bars, bars_title="Всего за жизнь диска", note=self.HINT)
+
+    def _snap_bat_health(self, p, blog):
+        last = blog[-1] if blog else None
+        h = last["health_pct"] if last else None
+        trend = history.battery_trend(blog)
+        p.set_data(headline=f"{h:.0f}% от паспортной ёмкости" if h is not None else "Нет данных",
+                   meters=[("Осталось от новой батареи", (h or 0) / 100, f"{h or 0:.1f}%")],
+                   note=(f"Тренд: {trend}. " if trend else "Замер раз в день; тренд появится через неделю. ")
+                   + (f"Циклов: {last['cycles']}." if last and last.get("cycles") is not None else ""))
 
     @staticmethod
     def _before_after_html(ba) -> str:
@@ -570,7 +663,8 @@ class TrayApp(QObject):
         self.menu = menu  # держим ссылку, иначе меню соберёт сборщик мусора
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._activated)
-        self.tray.messageClicked.connect(self.show_window)
+        self.tray.messageClicked.connect(self._message_clicked)
+        self.last_report = None
         self.tray.show()
 
         self.window = MainWindow(self)
@@ -714,35 +808,107 @@ class TrayApp(QObject):
             self.tray.showMessage(f"Плановая очистка: освобождено {human(freed)}", "\n".join(log)[:400],
                                   QSystemTrayIcon.MessageIcon.Information, 15000)
 
+    def _message_clicked(self):
+        # последнее уведомление было о сбросе — открываем разбор, иначе окно
+        if self.last_report is not None:
+            subprocess.Popen(["xdg-open", str(self.last_report)], start_new_session=True)
+            self.last_report = None
+        else:
+            self.show_window()
+
+    def _notify_reports(self, reports):
+        fresh = [(b, p) for b, p in reports
+                 if time.time() - b.last.timestamp() < self.cfg.reset_report_notify_hours * 3600]
+        if fresh:
+            b, path = fresh[-1]
+            self.last_report = path
+            self.tray.showMessage(f"Был жёсткий сброс {b.last:%d.%m %H:%M}",
+                                  "Собран разбор: что происходило перед сбросом. Нажмите, чтобы открыть.",
+                                  QSystemTrayIcon.MessageIcon.Warning, 30000)
+
     def refresh(self):
         if self.worker and self.worker.isRunning():
             return
         self.window.refresh_btn.setEnabled(False)
-        self.worker = Worker(lambda: checks.run_all(self.cfg), self)
+        self.worker = Worker(self._check_cycle, self)
         self.worker.done.connect(self._on_results)
         self.worker.start()
 
-    def _on_results(self, results):
-        self.window.refresh_btn.setEnabled(True)
-        if isinstance(results, Exception):
-            self.tray.setToolTip(f"Ошибка проверки: {results}")
-            return
-        worst = max((r.status for r in results), default=Status.OK)
+    def _check_cycle(self):
+        """Фоновый поток: проверки, замер в историю, разбор новых сбросов, автоперезапуск зарядки."""
+        results = checks.run_all(self.cfg)
+        try:
+            history.record(testguard.mem_snapshot(), top=postmortem.top_processes())
+            history.record_battery_daily(self.cfg.battery)
+        except OSError:
+            pass
+        reports = []
+        boots = checks.finished_boots()
+        if postmortem.new_resets(boots):
+            rows = history.load(time.time() - 40 * 86400)
+            drives = checks.nvme_drives()
+            reports = postmortem.write_reports(boots, rows, history.load_events(0, boots),
+                                               checks.nvme_smart(drives[0]) if drives else None)
+        kicked = self._maybe_kick_charging(results)
+        return results, reports, kicked
+
+    def _maybe_kick_charging(self, results):
+        """Батарея «Не заряжается» и включён автоперезапуск — перезапустить, не чаще раза в 30 минут."""
+        if not self.cfg.auto_kick_charging:
+            return None
+        bat = next((r for r in results if r.id == "battery"), None)
+        if not bat or bat.status != Status.ERROR or not bat.summary.startswith("Не заряжается"):
+            return None
+        if time.time() - state.load().get("last_charging_kick", 0) < 1800:
+            return None
+        state.update(last_charging_kick=time.time())
+        ok, out = actions.kick_charging_nopass(self.cfg.battery)
+        return out if ok else None
+
+    def apply_config(self):
+        """После сохранения настроек: интервалы таймеров и немедленная проверка."""
+        self.timer.setInterval(max(1, self.cfg.check_interval_min) * 60_000)
+        self.mem_timer.setInterval(max(5, self.cfg.mem_watch_interval_s) * 1000)
+        self.refresh()
+
+    def update_tray(self, results):
+        """Цвет значка и подсказка — без отложенных проблем. Возвращает неотложенные результаты."""
+        active = [r for r in results if not r.snoozed]
+        worst = max((r.status for r in active), default=Status.OK)
         worst = Status.OK if worst == Status.INFO else worst
         self.tray.setIcon(status_icon(worst))
         self.window.setWindowIcon(status_icon(worst))
+        problems = [r for r in active if r.status >= Status.WARN]
+        hidden = sum(1 for r in results if r.snoozed)
+        self.tray.setToolTip("Здоровье ноутбука: " + (
+            "\n".join(f"• {r.title}: {r.summary}" for r in problems) if problems else "всё в порядке")
+            + (f"\n(отложено: {hidden})" if hidden else ""))
+        return active
+
+    def apply_snoozes(self, results):
+        sn = snooze.all_snoozes()
+        for r in results:
+            r.snoozed = r.status >= Status.WARN and snooze.is_snoozed(r.id, r.summary, sn)
+        return results
+
+    def _on_results(self, res):
+        self.window.refresh_btn.setEnabled(True)
+        if isinstance(res, Exception):
+            self.tray.setToolTip(f"Ошибка проверки: {res}")
+            return
+        results, reports, kicked = res
+        self.last_results = self.apply_snoozes(results)
+        active = self.update_tray(results)
         self.window.set_results(results)
-        try:
-            history.record(testguard.mem_snapshot())
-        except OSError:
-            pass
+        self._notify_reports(reports)
+        if kicked:
+            log_event("charging", "зарядка перезапущена автоматически")
+            self.tray.showMessage("Зарядка перезапущена", kicked, QSystemTrayIcon.MessageIcon.Information, 15000)
         if cleanup.auto_clean_due(self.cfg) and not (self.auto_clean_job and self.auto_clean_job.isRunning()):
             self.auto_clean_job = Worker(lambda: cleanup.run_auto_clean(self.cfg), self)
             self.auto_clean_job.done.connect(self._auto_cleaned)
             self.auto_clean_job.start()
-        problems = [r for r in results if r.status >= Status.WARN]
-        self.tray.setToolTip("Здоровье ноутбука: " + (
-            "\n".join(f"• {r.title}: {r.summary}" for r in problems) if problems else "всё в порядке"))
+        problems = [r for r in active if r.status >= Status.WARN]
         current = {(r.id, r.summary) for r in problems}
         new = [r for r in problems if (r.id, r.summary) not in (self.prev_problems or set())]
         if new:

@@ -72,6 +72,16 @@ class Config:
         "pip", "uv", "npm", "yarn", "thumbs", "docker_dangling"])
     # История замеров для графиков, дней
     history_days: int = 30
+    # Разбор жёстких сбросов: уведомлять о сбросах не старше N часов (старые — только отчёт)
+    reset_report_notify_hours: int = 24
+    # Порты: слушающие не только на localhost считаются открытыми наружу; эти порты/диапазоны разрешены
+    ports_allow: list[str] = field(default_factory=lambda: ["1714-1764"])  # KDE Connect
+    # Автоматически перезапускать зависшую зарядку (без пароля, отдельный узкий помощник)
+    auto_kick_charging: bool = False
+    # Крупные старые файлы: где искать, от какого размера (МБ) и возраста (дней)
+    large_files_dirs: list[str] = field(default_factory=lambda: ["~/Downloads"])
+    large_file_min_mb: int = 100
+    large_file_min_age_days: int = 60
 
     @classmethod
     def load(cls) -> "Config":

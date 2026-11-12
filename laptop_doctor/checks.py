@@ -46,6 +46,7 @@ class CheckResult:
     summary: str
     details: str = ""
     fix: Fix | None = None
+    snoozed: bool = False  # проставляет интерфейс: отложенная проблема не красит значок и не уведомляет
 
 
 # ---------------------------------------------------------------- hard resets
@@ -99,6 +100,13 @@ def short_sample(sample: str) -> str:
     return " ".join(parts)
 
 
+def open_path(p) -> list[str]:
+    import subprocess
+    subprocess.Popen(["xdg-open", str(p)], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return [f"✓ открыт {p}"]
+
+
 def check_resets(cfg: Config) -> CheckResult:
     boots = finished_boots()
     since = datetime.fromisoformat(cfg.fix_applied_since) if cfg.fix_applied_since else None
@@ -113,18 +121,27 @@ def check_resets(cfg: Config) -> CheckResult:
         "Жёсткий сброс = загрузка, журнал которой оборвался без штатного выключения.\n"
         f"Журнал хранит историю с {oldest:%d.%m.%Y}.\n\n" if oldest else ""
     ) + ("\n".join(lines) if lines else "Жёстких сбросов в журнале нет.")
+    from . import postmortem
+    reports = postmortem.list_reports()
+    fix = None
+    if reports:
+        details += "\n\nРазборы сбросов (что происходило перед ними):\n" + "\n".join(
+            f"  {postmortem.summary_line(p)} — {p}" for p in reports[:10])
+        fix = Fix("Открыть последний разбор", f"Открыть {reports[0].name}?",
+                  py_action=lambda p=reports[0]: open_path(p))
     if since is None:
         if resets:
             return CheckResult("resets", "Жёсткие сбросы", Status.WARN,
-                               f"{len(resets)} сброс(ов) в журнале — последний {resets[-1].last:%d.%m %H:%M}", details)
-        return CheckResult("resets", "Жёсткие сбросы", Status.OK, "Нет сбросов в журнале", details)
+                               f"{len(resets)} сброс(ов) в журнале — последний {resets[-1].last:%d.%m %H:%M}", details,
+                               fix)
+        return CheckResult("resets", "Жёсткие сбросы", Status.OK, "Нет сбросов в журнале", details, fix)
     if after:
         return CheckResult("resets", "Жёсткие сбросы", Status.ERROR,
                            f"{len(after)} сброс(ов) после фикса — последний {after[-1].last:%d.%m %H:%M}",
-                           details + "\n\nФикс не помог (или причина не одна).")
+                           details + "\n\nФикс не помог (или причина не одна).", fix)
     days = max((datetime.now() - since).total_seconds() / 86400, 0)
     return CheckResult("resets", "Жёсткие сбросы", Status.OK,
-                       f"Нет сбросов после фикса ({days:.1f} дн. наблюдения)", details)
+                       f"Нет сбросов после фикса ({days:.1f} дн. наблюдения)", details, fix)
 
 
 # ---------------------------------------------------------------- discrete GPU
@@ -257,6 +274,12 @@ def check_battery(cfg: Config) -> CheckResult:
     summary = f"{cap}% ({st}), порог {thr}%, износ: осталось {health} ёмкости"
     details = (f"Заряд: {cap}%, статус: {st}, от сети: {'да' if ac else 'нет'}\n"
                f"Порог заряда: {thr}%\nЁмкость: {health} от паспортной\nЦиклов: {cycles}")
+    from . import history
+    blog = history.load_battery()
+    trend = history.battery_trend(blog)
+    details += ("\nИзнос: " + trend) if trend else (
+        f"\nИзнос: замеры ёмкости раз в день копятся с {blog[0]['date']} — тренд появится через неделю"
+        if blog else "")
     log = run(["journalctl", "-u", "hw-watch", "--since", "-20min", "-o", "cat", "--no-pager"], timeout=20) or ""
     stuck = charging_stuck(parse_power_samples(log), thr or 100)
     if stuck:
@@ -928,6 +951,113 @@ def check_updates(cfg: Config) -> CheckResult:
     return CheckResult("updates", title, Status.OK, "Всё обновлено", details)
 
 
+def parse_listeners(out: str) -> list[tuple[str, int, str]]:
+    """`ss -tlnpH` → [(адрес, порт, процесс или "")]."""
+    res = []
+    for ln in out.splitlines():
+        cols = ln.split()
+        if len(cols) < 4:
+            continue
+        local = cols[3]
+        addr, _, port = local.rpartition(":")
+        if not port.isdigit():
+            continue
+        addr = addr.strip("[]").split("%")[0]
+        m = re.search(r'users:\(\("([^"]+)"', ln)
+        res.append((addr, int(port), m.group(1) if m else ""))
+    return res
+
+
+def address_scope(addr: str) -> str:
+    """local — только этот компьютер; tailnet — только сеть Tailscale; public — все интерфейсы/LAN."""
+    import ipaddress
+    if addr in ("*", "0.0.0.0", "::", ""):
+        return "public"
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return "public"
+    if ip.is_loopback:
+        return "local"
+    if ip in ipaddress.ip_network("100.64.0.0/10") or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
+        return "tailnet"
+    return "public"
+
+
+def port_allowed(port: int, allow: list[str]) -> bool:
+    for a in allow:
+        lo, _, hi = str(a).partition("-")
+        if lo.isdigit() and int(lo) <= port <= int(hi or lo):
+            return True
+    return False
+
+
+def docker_port_owners() -> dict[int, str]:
+    out = run(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"], timeout=20) or ""
+    owners = {}
+    for ln in out.splitlines():
+        name, _, ports = ln.partition("\t")
+        for m in re.finditer(r"(?:[\d.]+|\[::\]):(\d+)->(\d+)/tcp", ports):
+            owners[int(m.group(1))] = f"Docker: {name} (внутри порт {m.group(2)})"
+    return owners
+
+
+def firewall_state() -> str:
+    ufw_conf = read("/etc/ufw/ufw.conf", "") or ""
+    if re.search(r"^ENABLED=yes", ufw_conf, re.M):
+        return "ufw включён (но Docker публикует порты в обход ufw)"
+    if (run(["systemctl", "is-active", "firewalld"], ok_codes=(0, 3)) or "").strip() == "active":
+        return "firewalld включён (Docker может публиковать порты в обход него)"
+    return "файрвол выключен"
+
+
+WELL_KNOWN = {22: "SSH", 53: "DNS", 631: "печать (CUPS)", 3306: "MySQL/MariaDB", 5432: "PostgreSQL",
+              6379: "Redis", 27017: "MongoDB", 9200: "Elasticsearch", 11211: "Memcached"}
+SENSITIVE = {3306, 5432, 6379, 27017, 9200, 11211}  # базы и кэши без пароля по умолчанию — опаснее всего
+
+
+def check_ports(cfg: Config) -> CheckResult:
+    title = "Открытые порты"
+    out = run(["ss", "-tlnpH"], timeout=15)
+    if out is None:
+        return CheckResult("ports", title, Status.INFO, "ss недоступен")
+    listeners = parse_listeners(out)
+    owners = docker_port_owners()
+    exposed: dict[int, str] = {}
+    tailnet, allowed = set(), set()
+    for addr, port, proc in listeners:
+        scope = address_scope(addr)
+        who = owners.get(port) or proc or WELL_KNOWN.get(port, "процесс root/другого пользователя")
+        if scope == "public":
+            (allowed.add((port, who)) if port_allowed(port, cfg.ports_allow) else exposed.setdefault(port, who))
+        elif scope == "tailnet":
+            tailnet.add((port, who))
+    fw = firewall_state()
+    sensitive = sorted(p for p, who in exposed.items()
+                       if p in SENSITIVE or any(f"внутри порт {x})" in who for x in SENSITIVE))
+    parts = []
+    if exposed:
+        parts.append("Доступны из сети (все интерфейсы):\n" + "\n".join(
+            f"  {p:>5}  {who}" + ("  ← база/кэш!" if p in sensitive else "") for p, who in sorted(exposed.items())))
+    if allowed:
+        parts.append("Разрешены настройкой ports_allow:\n" + "\n".join(f"  {p:>5}  {w}" for p, w in sorted(allowed)))
+    if tailnet:
+        parts.append("Только для сети Tailscale:\n" + "\n".join(f"  {p:>5}  {w}" for p, w in sorted(tailnet)))
+    parts.append(f"Файрвол: {fw}.")
+    if exposed:
+        parts.append("Как закрыть: для Docker пишите в docker-compose порт с адресом — \"127.0.0.1:3316:3306\" "
+                     "вместо \"3316:3306\" — и пересоздайте контейнер. Для своих программ — слушать 127.0.0.1. "
+                     "Разрешить порт сознательно — добавьте его в ports_allow.")
+    details = "\n\n".join(parts)
+    if sensitive:
+        return CheckResult("ports", title, Status.WARN,
+                           f"Базы/кэши доступны из сети: порты {', '.join(map(str, sensitive))}; {fw}", details)
+    if exposed:
+        return CheckResult("ports", title, Status.WARN,
+                           f"Доступны из сети: {', '.join(map(str, sorted(exposed)))}; {fw}", details)
+    return CheckResult("ports", title, Status.OK, f"Наружу ничего лишнего; {fw}", details)
+
+
 def check_reboot_required(cfg: Config) -> CheckResult:
     if Path("/run/reboot-required").exists():
         pkgs = read("/run/reboot-required.pkgs", "") or ""
@@ -940,7 +1070,7 @@ CHECKS: list[Callable[[Config], CheckResult]] = [
     check_resets, check_dgpu, check_temps, check_battery,
     check_docker_loops, check_unhealthy, check_docker_cpu, check_abandoned,
     check_failed, check_reenabled,
-    check_memory, check_tests, check_git, check_ssd, check_kernel, check_disk, check_journal, check_boot, check_power, check_updates, check_reboot_required,
+    check_memory, check_tests, check_git, check_ssd, check_kernel, check_disk, check_journal, check_boot, check_power, check_ports, check_updates, check_reboot_required,
 ]
 
 

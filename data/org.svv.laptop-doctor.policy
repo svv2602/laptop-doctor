@@ -14,4 +14,17 @@
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/laptop-doctor-helper</annotate>
   </action>
+  <action id="org.svv.laptop-doctor.charging">
+    <description>Restart stuck battery charging</description>
+    <description xml:lang="ru">Перезапуск зависшей зарядки (laptop-doctor)</description>
+    <message>Restart battery charging</message>
+    <message xml:lang="ru">Перезапустить зарядку батареи</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <!-- без пароля только для пользователя за экраном: помощник умеет лишь перезаписать порог заряда -->
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/laptop-doctor-charging</annotate>
+  </action>
 </policyconfig>

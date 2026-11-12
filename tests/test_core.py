@@ -433,7 +433,8 @@ def test_history_record_load_prune(tmp_path, monkeypatch):
 
 def test_auto_clean(tmp_path, monkeypatch):
     from laptop_doctor.config import Config
-    monkeypatch.setattr(cleanup, "STATE", tmp_path / "state.json")
+    from laptop_doctor import state
+    monkeypatch.setattr(state, "STATE", tmp_path / "state.json")
     monkeypatch.setattr(cleanup, "HOME", tmp_path)
     cfg = Config()
     assert not cleanup.auto_clean_due(cfg)  # по умолчанию выключено
@@ -529,3 +530,132 @@ def test_charging_stuck_detection(helper, monkeypatch, tmp_path):
     assert writes == ["100", "80"] and f.read_text() == "80"
     with pytest.raises(helper.Bad):
         helper.kick_charging({"battery": "../../x"})
+
+
+# ---------------------------------------------------------------- 1–8: разбор сбросов, отложенные, порты, …
+
+def test_parse_top_uses_second_sample():
+    from laptop_doctor import postmortem
+    out = ("top - 10:00:00 up 1:00\nTasks: 1\n\n    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n"
+           "      1 root      20   0  100000  50000   1000 S  99,0   0.1   0:01.00 stale\n"
+           "top - 10:00:01 up 1:00\nTasks: 1\n\n    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n"
+           "    200 me        20   0  100000   1.2g   1000 R  43,1   5.0   1:01.00 chrome --type=renderer\n"
+           "    201 me        20   0  100000 572380   1000 S  11.8   1.0   0:31.00 kwin_wayland\n")
+    top = postmortem.parse_top(out)
+    assert top[0][:2] == ["chrome --type=renderer", 43.1] and top[1][0] == "kwin_wayland"
+    assert postmortem.fmt_res("1.2g") == "1.2 ГБ" and postmortem.fmt_res("572380") == "559.0 МБ"
+
+
+def test_postmortem_reports_once(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+
+    from laptop_doctor import postmortem, state
+    monkeypatch.setattr(state, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(postmortem, "REPORTS", tmp_path / "reports")
+    monkeypatch.setattr(postmortem, "run", lambda cmd, **kw: "журнал")
+    end = datetime.now() - timedelta(hours=1)
+    boots = [checks.BootEnd("aaa", end - timedelta(hours=2), end, False, ""),
+             checks.BootEnd("bbb", end, datetime.now(), True, "")]
+    rows = [{"ts": end.timestamp() - 120, "cpu_temp": 97, "top_cpu": [["phpunit", 180.0, "2g"]]}]
+    events = [(end.timestamp() - 600, "tests", "тесты остановлены"), (end.timestamp(), "reset", "сброс")]
+    done = postmortem.write_reports(boots, rows, events, {"unsafe_shutdowns": 129, "media_errors": 0,
+                                                          "percent_used": 7})
+    assert len(done) == 1
+    text = done[0][1].read_text()
+    assert "Температура CPU, °C: 97" in text and "phpunit: 180.0% CPU, память 2.0 ГБ" in text
+    assert "тесты остановлены" in text and "— сброс" not in text and "129" in text
+    assert postmortem.write_reports(boots, rows, events, None) == []   # второй раз не создаётся
+
+
+def test_snooze(tmp_path, monkeypatch):
+    from laptop_doctor import snooze, state
+    monkeypatch.setattr(state, "STATE", tmp_path / "state.json")
+    assert not snooze.is_snoozed("git", "давно не закоммичено: 7")
+    snooze.snooze("git", summary="давно не закоммичено: 7")
+    assert snooze.is_snoozed("git", "давно не закоммичено: 7")
+    assert not snooze.is_snoozed("git", "давно не закоммичено: 8")      # изменилось — снова видно
+    snooze.snooze("updates", days=7)
+    sn = snooze.all_snoozes()
+    assert snooze.is_snoozed("updates", "что угодно", sn)
+    import time
+    assert not snooze.is_snoozed("updates", "x", sn, now=time.time() + 8 * 86400)
+    snooze.unsnooze("updates")
+    assert not snooze.is_snoozed("updates", "x")
+
+
+def test_ports_parsing_and_scope(monkeypatch):
+    from laptop_doctor.config import Config
+    ss = ("LISTEN 0 4096 0.0.0.0:3316 0.0.0.0:*\n"
+          "LISTEN 0 4096 127.0.0.1:5433 0.0.0.0:*\n"
+          "LISTEN 0 50 *:1716 *:* users:((\"kdeconnectd\",pid=5398,fd=20))\n"
+          "LISTEN 0 4096 [::]:8080 [::]:*\n"
+          "LISTEN 0 4096 100.118.110.123:41837 0.0.0.0:*\n"
+          "LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*\n")
+    ls = checks.parse_listeners(ss)
+    assert ("0.0.0.0", 3316, "") in ls and ("*", 1716, "kdeconnectd") in ls and ("127.0.0.53", 53, "") in ls
+    assert [checks.address_scope(a) for a in ("0.0.0.0", "::", "127.0.0.1", "::1", "100.118.110.123", "192.168.1.5")] \
+        == ["public", "public", "local", "local", "tailnet", "public"]
+    assert checks.port_allowed(1716, ["1714-1764"]) and not checks.port_allowed(3316, ["1714-1764", "22"])
+    monkeypatch.setattr(checks, "run", lambda cmd, **kw: ss if cmd[0] == "ss" else
+                        "shop-mysql-1\t0.0.0.0:3316->3306/tcp, [::]:3316->3306/tcp\nshop-nginx-1\t0.0.0.0:8080->80/tcp")
+    monkeypatch.setattr(checks, "firewall_state", lambda: "файрвол выключен")
+    r = checks.check_ports(Config())
+    assert r.status == checks.Status.WARN and "3316" in r.summary and "База" not in r.summary
+    assert "shop-mysql-1" in r.details and "← база/кэш!" in r.details
+
+
+def test_charging_helper_refuses_without_root():
+    p = _sp.run([_sys.executable, str(ROOT / "helper" / "laptop-doctor-charging"), "BAT1"], capture_output=True)
+    assert p.returncode == 2 and "root" in p.stderr.decode()
+
+
+def test_battery_trend():
+    from laptop_doctor import history
+    day = 86400
+    assert history.battery_trend([{"ts": 0, "health_pct": 78.3, "cycles": 818}]) is None
+    t = history.battery_trend([{"ts": 0, "health_pct": 78.3, "cycles": 818},
+                               {"ts": 100 * day, "health_pct": 76.3, "cycles": 868}])
+    assert t.startswith("-2.0% ёмкости за 100 дн") and "+50 циклов" in t and "-7.3% в год" in t
+
+
+def test_large_old_files(tmp_path):
+    from laptop_doctor.config import Config
+    d = tmp_path / "dl"
+    d.mkdir()
+    big_old, big_new, small_old = d / "old.iso", d / "new.iso", d / "small.txt"
+    for f, size in ((big_old, 3 * 1024 ** 2), (big_new, 3 * 1024 ** 2), (small_old, 10)):
+        with f.open("wb") as fh:
+            fh.truncate(size)
+    old = _time.time() - 100 * 86400
+    for f in (big_old, small_old):
+        _os.utime(f, (old, old))
+    (d / "link.iso").symlink_to(big_old)
+    cfg = Config()
+    cfg.large_files_dirs, cfg.large_file_min_mb, cfg.large_file_min_age_days = [str(d)], 2, 60
+    assert [p.name for p, _ in cleanup.large_old_files(cfg)] == ["old.iso"]
+
+
+def test_settings_validate_and_roundtrip():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    from laptop_doctor.config import Config
+    from laptop_doctor.settings_ui import SettingsDialog, validate
+    assert validate({"fix_applied_since": "вчера"}).startswith("«Фикс применён»")
+    assert validate({"ports_allow": ["22", "1714-1764"]}) is None
+    assert "регулярка" in validate({"kernel_error_ignore": ["(["]})
+    cfg = Config()
+    cfg.project_roots = ["~/a", "~/b"]
+    vals = SettingsDialog(cfg).values()
+    assert vals["project_roots"] == ["~/a", "~/b"] and vals["auto_kick_charging"] is False
+    assert vals["check_interval_min"] == cfg.check_interval_min
+
+
+def test_report_build():
+    from laptop_doctor import report
+    r = checks.CheckResult("ports", "Открытые порты", checks.Status.WARN, "Доступны из сети: 3316", "детали | тут")
+    text = report.build([r], {"temp_before": 94, "temp_after": 78, "resets_before": 3, "days_before": 12.6,
+                              "resets_after": 0, "days_after": 0.1})
+    assert "## Система" in text and "| Внимание | Открытые порты | Доступны из сети: 3316 |" in text
+    assert "94 °C → 78 °C" in text and "детали | тут" in text

@@ -11,6 +11,7 @@ python3 -c "import PyQt6.QtWidgets" 2>/dev/null || { echo "Нужен PyQt6: sud
 
 echo "==> root-помощник и правило polkit (нужен пароль sudo)"
 sudo install -o root -g root -m 0755 "$REPO/helper/laptop-doctor-helper" /usr/local/libexec/laptop-doctor-helper
+sudo install -o root -g root -m 0755 "$REPO/helper/laptop-doctor-charging" /usr/local/libexec/laptop-doctor-charging
 sudo install -o root -g root -m 0644 "$REPO/data/org.svv.laptop-doctor.policy" \
   /usr/share/polkit-1/actions/org.svv.laptop-doctor.policy
 

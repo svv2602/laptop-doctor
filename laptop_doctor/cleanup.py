@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from . import state
 from .config import Config
 from .util import dir_size, parse_docker_size, run
 
@@ -176,6 +177,31 @@ def _dir_target(path: Path) -> Callable[[], tuple[int, str]]:
     return lambda: (dir_size(path), str(path).replace(str(HOME), "~"))
 
 
+def large_old_files(cfg: Config) -> list[tuple[Path, int]]:
+    """Крупные давно не открывавшиеся/не менявшиеся файлы в выбранных папках (без перехода по ссылкам)."""
+    import os
+    min_size = cfg.large_file_min_mb * 1024 ** 2
+    cutoff = time.time() - cfg.large_file_min_age_days * 86400
+    res = []
+    for d in cfg.large_files_dirs:
+        root = Path(d).expanduser()
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [x for x in dirnames if not x.startswith(".")]
+            for fn in filenames:
+                p = Path(dirpath) / fn
+                try:
+                    st = p.lstat()
+                except OSError:
+                    continue
+                if p.is_symlink() or not p.is_file():
+                    continue
+                if st.st_size >= min_size and max(st.st_mtime, st.st_atime) < cutoff:
+                    res.append((p, st.st_size))
+    return sorted(res, key=lambda x: -x[1])
+
+
 def make_targets(cfg: Config) -> list[Target]:
     trash = HOME / ".local/share/Trash"
     user_dirs = [
@@ -224,6 +250,22 @@ def make_targets(cfg: Config) -> list[Target]:
         from . import projects
         return Plan(remove_paths=[a.path for pa in projects.inactive_artifacts(cfg) for a in pa.artifacts])
 
+    def large_estimate() -> tuple[int, str]:
+        from .util import human
+        files = large_old_files(cfg)
+        if not files:
+            return 0, "не найдено"
+        top = ", ".join(f"{p.name} {human(sz)}" for p, sz in files[:5])
+        return sum(sz for _, sz in files), f"{len(files)} файл(ов): {top}" + ("…" if len(files) > 5 else "")
+
+    def large_plan() -> Plan:
+        files = [p for p, _ in large_old_files(cfg)]
+        return Plan(user_cmds=[["gio", "trash", "--", *map(str, files)]] if files else [])
+
+    targets.append(Target("large_files",
+                          f"Крупные файлы (>{cfg.large_file_min_mb} МБ, старше {cfg.large_file_min_age_days} дн.)",
+                          "в " + ", ".join(cfg.large_files_dirs) + " — перемещаются в корзину, не удаляются",
+                          False, large_estimate, large_plan, default_checked=False))
     targets.append(Target("dev_artifacts", f"Мусор сборки в проектах, не менявшихся {cfg.dev_artifacts_min_age_days}+ дн.",
                           "node_modules, .venv, target/, .dart_tool, build/ — пересоздаются при следующей "
                           "установке/сборке; проекты с работающими контейнерами не трогаются", False,
@@ -265,25 +307,10 @@ def apply_user_paths(plan: Plan) -> list[str]:
 
 # ------------------------------------------------------------------ плановая очистка
 
-STATE = Path.home() / ".local" / "state" / "laptop-doctor" / "state.json"
-
-
-def _state() -> dict:
-    try:
-        return json.loads(STATE.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _save_state(d: dict) -> None:
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(d))
-
-
 def auto_clean_due(cfg: Config, now: float | None = None) -> bool:
     if not cfg.auto_clean_enabled:
         return False
-    last = _state().get("last_auto_clean", 0)
+    last = state.load().get("last_auto_clean", 0)
     return (now or time.time()) - last >= cfg.auto_clean_interval_days * 86400
 
 
@@ -307,8 +334,5 @@ def run_auto_clean(cfg: Config) -> tuple[int, list[str]]:
             log.append(f"✓ {t.title}: {human(size)}")
         else:
             log.append(f"✗ {t.title}: {out[-200:]}")
-    st = _state()
-    st["last_auto_clean"] = time.time()
-    st["last_auto_clean_freed"] = freed
-    _save_state(st)
+    state.update(last_auto_clean=time.time(), last_auto_clean_freed=freed)
     return freed, log

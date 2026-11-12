@@ -1,0 +1,35 @@
+#!/usr/bin/python3 -I
+"""laptop-doctor: перезапуск зависшей зарядки. Запускается через pkexec БЕЗ пароля (узкое правило polkit),
+поэтому умеет ровно одно: перезаписать порог заряда указанной батареи (100% → прежний).
+
+Usage: laptop-doctor-charging BAT1
+"""
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+
+def main():
+    if os.geteuid() != 0:
+        print("нужен root (запускается через pkexec)", file=sys.stderr)
+        return 2
+    bat = sys.argv[1] if len(sys.argv) == 2 else ""
+    if not re.fullmatch(r"BAT\d", bat):
+        print("ожидалось имя батареи вида BAT1", file=sys.stderr)
+        return 2
+    f = Path(f"/sys/class/power_supply/{bat}/charge_control_end_threshold")
+    cur = f.read_text().strip()
+    if not (cur.isdigit() and 1 <= int(cur) <= 100):
+        print(f"странный текущий порог: {cur!r}", file=sys.stderr)
+        return 1
+    f.write_text("100")
+    time.sleep(2)
+    f.write_text(cur)
+    print(f"зарядка перезапущена (порог {cur}% → 100% → {cur}%)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

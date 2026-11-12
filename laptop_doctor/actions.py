@@ -7,6 +7,15 @@ from pathlib import Path
 from .util import run_full
 
 HELPER = Path("/usr/local/libexec/laptop-doctor-helper")
+CHARGING_HELPER = Path("/usr/local/libexec/laptop-doctor-charging")
+
+
+def kick_charging_nopass(battery: str) -> tuple[bool, str]:
+    """Перезапуск зарядки без пароля (узкий помощник с правилом polkit allow_active=yes)."""
+    if not CHARGING_HELPER.exists():
+        return False, f"не установлен {CHARGING_HELPER} — запустите install.sh"
+    code, out = run_full(["pkexec", str(CHARGING_HELPER), battery], timeout=30)
+    return code == 0, out
 
 
 def run_root(actions: list[dict]) -> tuple[bool, str]:

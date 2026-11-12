@@ -15,8 +15,9 @@ STATE_DIR = Path.home() / ".local" / "state" / "laptop-doctor"
 HISTORY = STATE_DIR / "history.jsonl"
 
 
-def record(snap) -> None:
-    """Добавить замер (вызывается после каждой проверки, раз в несколько минут)."""
+def record(snap, top: list | None = None) -> None:
+    """Добавить замер (вызывается после каждой проверки, раз в несколько минут).
+    top — топ процессов по CPU: по нему потом видно, что работало перед жёстким сбросом."""
     zones = thermal_zones()
     row = {
         "ts": int(time.time()),
@@ -37,9 +38,11 @@ def record(snap) -> None:
     if bat:
         cap = read(bat / "capacity")
         row["battery_pct"] = int(cap) if cap and cap.isdigit() else None
+    if top:
+        row["top_cpu"] = top
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with HISTORY.open("a") as f:
-        f.write(json.dumps(row) + "\n")
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def nvme_temp() -> int | None:
@@ -224,3 +227,54 @@ def current_snapshot() -> dict:
         "throttle_pct": (int(thr) / 10 / float(up.split()[0])) if thr and thr.isdigit() and up else None,
         "uptime_h": float(up.split()[0]) / 3600 if up else None,
     }
+
+
+# ------------------------------------------------------------------ износ батареи (раз в день, хранится долго)
+
+BATTERY_LOG = STATE_DIR / "battery.jsonl"
+
+
+def record_battery_daily(battery: str = "BAT1") -> bool:
+    """Раз в сутки записать ёмкость и циклы. True — если запись добавлена."""
+    b = Path("/sys/class/power_supply") / battery
+    full, design = read(b / "charge_full"), read(b / "charge_full_design")
+    if not (full and design and full.isdigit() and design.isdigit() and int(design)):
+        return False
+    today = date.today().isoformat()
+    rows = load_battery()
+    if rows and rows[-1].get("date") == today:
+        return False
+    cycles = read(b / "cycle_count")
+    row = {"date": today, "ts": int(time.time()), "health_pct": round(int(full) / int(design) * 100, 1),
+           "cycles": int(cycles) if cycles and cycles.isdigit() else None}
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with BATTERY_LOG.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    return True
+
+
+def load_battery() -> list[dict]:
+    if not BATTERY_LOG.exists():
+        return []
+    res = []
+    for ln in BATTERY_LOG.read_text().splitlines():
+        try:
+            res.append(json.loads(ln))
+        except json.JSONDecodeError:
+            pass
+    return res
+
+
+def battery_trend(rows: list[dict]) -> str | None:
+    """«−1.2% ёмкости и +35 циклов за 90 дн (≈ −4.9% в год)» или None, если данных меньше недели."""
+    if len(rows) < 2:
+        return None
+    a, b = rows[0], rows[-1]
+    days = (b["ts"] - a["ts"]) / 86400
+    if days < 7:
+        return None
+    dh = b["health_pct"] - a["health_pct"]
+    text = f"{dh:+.1f}% ёмкости за {days:.0f} дн (≈ {dh / days * 365:+.1f}% в год)"
+    if a.get("cycles") is not None and b.get("cycles") is not None:
+        text += f", +{b['cycles'] - a['cycles']} циклов"
+    return text
