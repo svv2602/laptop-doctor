@@ -1,0 +1,177 @@
+#!/usr/bin/python3 -I
+"""laptop-doctor privileged helper. Runs as root via pkexec.
+
+Usage: laptop-doctor-helper '<json list of actions>'
+
+Only a fixed set of actions with strictly validated arguments is accepted.
+Installed root-owned to /usr/local/libexec/laptop-doctor-helper.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C.UTF-8"}
+UNIT_RE = re.compile(r"^[A-Za-z0-9@._:-]+\.(service|socket)$")
+
+
+class Bad(Exception):
+    pass
+
+
+def sh(cmd, check=True, timeout=1800):
+    p = subprocess.run(cmd, capture_output=True, text=True, env=ENV, timeout=timeout)
+    out = (p.stdout + p.stderr).strip()
+    if check and p.returncode != 0:
+        raise RuntimeError(f"{' '.join(cmd)} → код {p.returncode}: {out[-500:]}")
+    return out
+
+
+def need(cond, msg):
+    if not cond:
+        raise Bad(msg)
+
+
+# ------------------------------------------------------------------ actions
+
+def set_battery_threshold(a):
+    bat, val = a.get("battery"), a.get("value")
+    need(isinstance(bat, str) and re.fullmatch(r"BAT\d", bat), "battery")
+    need(isinstance(val, int) and 50 <= val <= 100, "value")
+    Path(f"/sys/class/power_supply/{bat}/charge_control_end_threshold").write_text(str(val))
+    Path("/etc/udev/rules.d/81-battery-threshold.rules").write_text(
+        f'ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="{bat}", '
+        f'ATTR{{charge_control_end_threshold}}="{val}"\n')
+    return f"порог заряда {bat} = {val}% (правило udev обновлено)"
+
+
+def arc_autosuspend(a):
+    pci = a.get("pci")
+    need(isinstance(pci, str) and re.fullmatch(r"0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", pci), "pci")
+    Path(f"/sys/bus/pci/devices/{pci}/power/control").write_text("auto")
+    return f"{pci}: power/control=auto"
+
+
+def _units(a, suffixes):
+    units = a.get("units")
+    need(isinstance(units, list) and units, "units")
+    for u in units:
+        need(isinstance(u, str) and UNIT_RE.fullmatch(u) and u.endswith(suffixes), f"unit {u!r}")
+    return units
+
+
+def disable_units(a):
+    units = _units(a, (".service", ".socket"))
+    sh(["systemctl", "disable", "--now", *units])
+    return "отключены: " + ", ".join(units)
+
+
+def restart_units(a):
+    units = _units(a, (".service",))
+    sh(["systemctl", "reset-failed", *units], check=False)
+    sh(["systemctl", "restart", *units])
+    return "перезапущены: " + ", ".join(units)
+
+
+def fix_remmina_socket(a):
+    listening = sh(["ss", "-xlH"], check=False)
+    removed = []
+    for s in Path("/var/snap/remmina").glob("*/ssh-agent.socket"):
+        if s.is_socket() and not s.is_symlink() and str(s) not in listening:
+            s.unlink()
+            removed.append(str(s))
+    sh(["systemctl", "reset-failed", "snap.remmina.ssh-agent.service"], check=False)
+    sh(["snap", "restart", "remmina.ssh-agent"])
+    return "remmina ssh-agent перезапущен" + (f", удалён залипший сокет {', '.join(removed)}" if removed else "")
+
+
+def journal_limit(a):
+    d = Path("/etc/systemd/journald.conf.d")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "size.conf").write_text("[Journal]\nSystemMaxUse=500M\n")
+    sh(["systemctl", "restart", "systemd-journald"])
+    sh(["journalctl", "--vacuum-size=500M"])
+    return "журнал ограничен 500 МБ"
+
+
+def remove_snap_revisions(a):
+    revs = a.get("revisions")
+    need(isinstance(revs, list), "revisions")
+    disabled = set()
+    for line in sh(["snap", "list", "--all"]).splitlines()[1:]:
+        cols = line.split()
+        if len(cols) >= 6 and "disabled" in cols[-1]:
+            disabled.add((cols[0], cols[2]))
+    done = []
+    for pair in revs:
+        need(isinstance(pair, list) and len(pair) == 2, "revision pair")
+        name, rev = pair
+        need(isinstance(name, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]*", name), f"snap {name!r}")
+        need(isinstance(rev, str) and rev.isdigit(), f"rev {rev!r}")
+        if (name, rev) in disabled:  # только отключённые версии, текущую не трогаем
+            sh(["snap", "remove", name, f"--revision={rev}"])
+            done.append(f"{name}@{rev}")
+    return f"удалено старых версий snap: {len(done)}"
+
+
+def apt_autoremove(a):
+    sh(["apt-get", "-y", "autoremove", "--purge"], timeout=3600)
+    return "apt autoremove выполнен"
+
+
+def clean_crash(a):
+    n = 0
+    for f in Path("/var/crash").glob("*.crash"):
+        if f.is_file() and not f.is_symlink():
+            f.unlink()
+            n += 1
+    return f"удалено отчётов: {n}"
+
+
+ACTIONS = {
+    "set-battery-threshold": set_battery_threshold,
+    "arc-autosuspend": arc_autosuspend,
+    "disable-units": disable_units,
+    "restart-units": restart_units,
+    "fix-remmina-socket": fix_remmina_socket,
+    "journal-limit": journal_limit,
+    "remove-snap-revisions": remove_snap_revisions,
+    "apt-autoremove": apt_autoremove,
+    "clean-crash": clean_crash,
+}
+
+
+def main():
+    if os.geteuid() != 0:
+        print("нужен root (запускается через pkexec)", file=sys.stderr)
+        return 2
+    try:
+        actions = json.loads(sys.argv[1])
+        need(isinstance(actions, list), "ожидался список действий")
+    except (IndexError, json.JSONDecodeError, Bad) as e:
+        print(f"неверные аргументы: {e}", file=sys.stderr)
+        return 2
+    failed = 0
+    for a in actions:
+        name = a.get("action") if isinstance(a, dict) else None
+        fn = ACTIONS.get(name)
+        if fn is None:
+            print(f"✗ неизвестное действие: {name!r}")
+            failed += 1
+            continue
+        try:
+            print(f"✓ {fn(a)}")
+        except Bad as e:
+            print(f"✗ {name}: неверный аргумент {e}")
+            failed += 1
+        except Exception as e:
+            print(f"✗ {name}: {e}")
+            failed += 1
+        sys.stdout.flush()
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

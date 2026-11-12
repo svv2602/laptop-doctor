@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="org.svv.laptop-doctor.helper">
+    <description>Run laptop-doctor maintenance actions</description>
+    <description xml:lang="ru">Обслуживание ноутбука (laptop-doctor)</description>
+    <message>Authentication is required to fix or clean up the system</message>
+    <message xml:lang="ru">Для исправления или очистки системы нужен пароль администратора</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/laptop-doctor-helper</annotate>
+  </action>
+</policyconfig>
