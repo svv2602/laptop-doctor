@@ -161,6 +161,31 @@ def p95(vals: list[int]) -> int:
     return s[max(0, int(len(s) * 0.95) - 1)]
 
 
+_throttle_prev: tuple[float, int] | None = None  # (uptime, package_throttle_total_time_ms)
+
+
+def throttle_info() -> tuple[str, float] | None:
+    """Троттлинг пакета CPU: текст и доля времени в троттлинге с прошлой проверки (%)."""
+    global _throttle_prev
+    base = Path("/sys/devices/system/cpu/cpu0/thermal_throttle")
+    total_ms, count = read_int(base / "package_throttle_total_time_ms"), read_int(base / "package_throttle_count")
+    up = read("/proc/uptime")
+    if total_ms is None or not up:
+        return None
+    uptime = float(up.split()[0])
+    since_boot = total_ms / 10 / uptime  # мс → % от времени
+    recent, had_prev = 0.0, False
+    if _throttle_prev and uptime > _throttle_prev[0]:
+        recent = (total_ms - _throttle_prev[1]) / 10 / (uptime - _throttle_prev[0])
+        had_prev = True
+    _throttle_prev = (uptime, total_ms)
+    text = (f"Троттлинг по температуре (процессор сбрасывает частоту): {count} событий с загрузки, "
+            f"суммарно {total_ms / 1000:.0f} с — {since_boot:.1f}% времени"
+            + (f"; с прошлой проверки {recent:.1f}%" if had_prev else "")
+            + ".\nКороткие события по миллисекундам — норма для тонкого ноутбука; плохо, когда это заметная доля времени.")
+    return text, recent
+
+
 def check_temps(cfg: Config) -> CheckResult:
     zones = thermal_zones()
     cur = zones.get("x86_pkg_temp") or zones.get("TCPU")
@@ -185,6 +210,12 @@ def check_temps(cfg: Config) -> CheckResult:
     else:
         details += "hw-watch за сегодня ничего не записал (сервис работает?)"
     details += f"\n\nПорог предупреждения: {cfg.temp_warn_c}°C (95% замеров за час)."
+    thr = throttle_info()
+    if thr:
+        details += "\n\n" + thr[0]
+        if thr[1] >= cfg.throttle_warn_pct:
+            status = max(status, Status.WARN)
+            summary += f", троттлинг {thr[1]:.0f}% времени"
     return CheckResult("temps", "Температура процессора", status, summary, details)
 
 
@@ -277,6 +308,31 @@ def check_docker_cpu(cfg: Config) -> CheckResult:
                            "\n\nЗамер разовый: если это сборка или тесты — подождите и обновите.", stop_fix(hogs))
     return CheckResult("docker_cpu", "Docker: нагрузка CPU", Status.OK,
                        f"{len(stats)} контейнеров, суммарно {total:.0f}% CPU", details)
+
+
+def check_unhealthy(cfg: Config) -> CheckResult:
+    title = "Docker: нездоровые контейнеры"
+    out = run(["docker", "ps", "--filter", "health=unhealthy", "--format", "{{.Names}}"], timeout=20)
+    if out is None:
+        return CheckResult("unhealthy", title, Status.INFO, "Docker недоступен")
+    names = out.split()
+    if not names:
+        return CheckResult("unhealthy", title, Status.OK, "Все контейнеры с healthcheck здоровы")
+    parts = []
+    for n in names:
+        h = run(["docker", "inspect", "-f", "{{json .State.Health}}", n], timeout=10) or "{}"
+        try:
+            health = json.loads(h) or {}
+        except json.JSONDecodeError:
+            health = {}
+        last = (health.get("Log") or [{}])[-1]
+        parts.append(f"■ {n}: {health.get('FailingStreak', '?')} неудачных проверок подряд\n"
+                     f"  последний ответ (код {last.get('ExitCode', '?')}): {(last.get('Output') or '').strip()[:400]}")
+    fix = Fix("Перезапустить", "Перезапустить контейнеры:\n" + "\n".join(names),
+              user_cmds=[["docker", "restart", *names]])
+    return CheckResult("unhealthy", title, Status.WARN, "Нездоровы: " + ", ".join(names),
+                       "\n\n".join(parts) + "\n\nКонтейнер работает, но его healthcheck не проходит — "
+                       "обычно сервис внутри завис или не может достучаться до зависимости.", fix)
 
 
 def check_abandoned(cfg: Config) -> CheckResult:
@@ -549,6 +605,206 @@ def check_tests(cfg: Config) -> CheckResult:
     return CheckResult("tests", title, Status.INFO, summary, details, fix)
 
 
+def check_git(cfg: Config) -> CheckResult:
+    from . import projects
+    title = "Незапушенная работа"
+    if not cfg.project_roots:
+        return CheckResult("git", title, Status.INFO, "Не настроено (project_roots)")
+    states = [projects.repo_state(r) for r in projects.repos(cfg)]
+    lim = cfg.git_dirty_warn_hours
+    stale = [s for s in states if s.dirty_files and projects.hours_ago(s.dirty_newest) > lim]
+    fresh = [s for s in states if s.dirty_files and s not in stale]
+    unpushed = [s for s in states if s.ahead]
+    old_unpushed = [s for s in unpushed if projects.hours_ago(s.ahead_oldest) > lim]
+    no_remote = [s for s in states if not s.has_remote and (s.last_commit or s.dirty_files)]
+    broken = [s for s in states if s.error]
+
+    def line(s, extra=""):
+        return f"  {s.name:<26} ветка {s.branch:<20} {extra}"
+
+    parts = []
+    if stale:
+        parts.append(f"Не закоммичено давно (> {lim} ч) — риск потерять при сбое:\n" + "\n".join(
+            line(s, f"{s.dirty_files} файл(ов), последняя правка {projects.fmt_age(s.dirty_newest)} назад")
+            for s in sorted(stale, key=lambda s: s.dirty_newest)))
+    if unpushed:
+        parts.append("Коммиты не отправлены на сервер:\n" + "\n".join(
+            line(s, f"{s.ahead} коммит(ов), самый старый {projects.fmt_age(s.ahead_oldest)} назад"
+                    + ("" if s.has_upstream else " (у ветки нет upstream)")) for s in unpushed))
+    if fresh:
+        parts.append("Текущая работа (свежие правки):\n" + "\n".join(
+            line(s, f"{s.dirty_files} файл(ов), {projects.fmt_age(s.dirty_newest)} назад") for s in fresh))
+    if no_remote:
+        parts.append("Нет удалённого репозитория — код только на этом диске:\n" + "\n".join(
+            line(s, "без коммитов" if not s.last_commit else "") for s in no_remote))
+    if broken:
+        parts.append("Не удалось проверить:\n" + "\n".join(line(s, s.error) for s in broken))
+    details = "\n\n".join(parts) or "Всё закоммичено и отправлено."
+    details += f"\n\nПроверено репозиториев: {len(states)} в " + ", ".join(cfg.project_roots)
+    bits = []
+    if stale:
+        bits.append(f"давно не закоммичено: {len(stale)}")
+    if old_unpushed:
+        bits.append(f"не отправлено: {len(old_unpushed)}")
+    if no_remote:
+        bits.append(f"без remote: {len(no_remote)}")
+    if stale or old_unpushed:
+        return CheckResult("git", title, Status.WARN, "; ".join(bits), details)
+    if fresh or unpushed or no_remote:
+        return CheckResult("git", title, Status.INFO,
+                           "; ".join(bits) or f"текущая работа в {len(fresh) + len(unpushed)} репо", details)
+    return CheckResult("git", title, Status.OK, f"Всё закоммичено и отправлено ({len(states)} репо)", details)
+
+
+UDISKS = "org.freedesktop.UDisks2"
+NVME_IFACE = "org.freedesktop.UDisks2.NVMe.Controller"
+_ssd_prev: dict[str, dict] = {}  # прошлые значения счётчиков — чтобы видеть рост между проверками
+
+
+def _busctl_json(*args: str):
+    out = run(["busctl", "--system", "--json=short", *args], timeout=15)
+    return json.loads(out)["data"] if out else None
+
+
+def nvme_drives() -> list[str]:
+    out = run(["busctl", "--system", "--list", "tree", UDISKS], timeout=15) or ""
+    drives = [x.strip() for x in out.split() if "/drives/" in x]
+    res = []
+    for d in drives:
+        intro = run(["busctl", "--system", "introspect", UDISKS, d], timeout=15) or ""
+        if NVME_IFACE in intro:
+            res.append(d)
+    return res
+
+
+def nvme_smart(drive: str) -> dict:
+    data = _busctl_json("call", UDISKS, drive, NVME_IFACE, "SmartGetAttributes", "a{sv}", "0")
+    attrs = {k: v["data"] for k, v in (data[0] if data else {}).items()}
+    for prop in ("SmartCriticalWarning", "SmartTemperature", "SmartPowerOnHours"):
+        v = _busctl_json("get-property", UDISKS, drive, NVME_IFACE, prop)
+        if v is not None:
+            attrs[prop] = v
+    model = _busctl_json("get-property", UDISKS, drive, "org.freedesktop.UDisks2.Drive", "Model")
+    attrs["model"] = model or drive.rsplit("/", 1)[-1]
+    return attrs
+
+
+def check_ssd(cfg: Config) -> CheckResult:
+    from .util import human
+    title = "Здоровье SSD"
+    drives = nvme_drives()
+    if not drives:
+        return CheckResult("ssd", title, Status.INFO, "NVMe-дисков не найдено (или нет UDisks2)")
+    worst, summaries, parts = Status.OK, [], []
+    for d in drives:
+        a = nvme_smart(d)
+        if "percent_used" not in a:
+            parts.append(f"{a['model']}: SMART недоступен")
+            continue
+        st, notes = Status.OK, []
+        warn = a.get("SmartCriticalWarning") or []
+        if warn:
+            st = Status.ERROR
+            notes.append("критическое предупреждение диска: " + ", ".join(warn))
+        used, spare, thr = a["percent_used"], a.get("avail_spare", 100), a.get("spare_thresh", 10)
+        if used >= 100 or spare < thr:
+            st = Status.ERROR
+            notes.append("ресурс исчерпан — пора менять диск")
+        elif used >= 80:
+            st = max(st, Status.WARN)
+            notes.append(f"износ {used}%")
+        if a.get("media_errors", 0):
+            st = max(st, Status.WARN)
+            notes.append(f"ошибки носителя: {a['media_errors']}")
+        prev = _ssd_prev.get(d, {})
+        grew = {k: a.get(k, 0) - prev[k] for k in ("critical_temp_time", "media_errors", "unsafe_shutdowns")
+                if k in prev and a.get(k, 0) > prev[k]}
+        if grew.get("critical_temp_time"):
+            st = max(st, Status.WARN)
+            notes.append(f"перегрев до критической температуры: +{grew['critical_temp_time']} мин")
+        _ssd_prev[d] = {k: a.get(k, 0) for k in ("critical_temp_time", "media_errors", "unsafe_shutdowns")}
+        temp_c = a.get("SmartTemperature", 0) - 273 if a.get("SmartTemperature") else None
+        worst = max(worst, st)
+        summaries.append(f"износ {used}%, {temp_c}°C" + (" — " + "; ".join(notes) if notes else ""))
+        parts.append(
+            f"{a['model']}\n"
+            f"  Износ (percent_used): {used}%   Резерв: {spare}% (порог {thr}%)\n"
+            f"  Ошибки носителя: {a.get('media_errors', 0)}   Записей в журнале ошибок: {a.get('num_err_log_entries', 0)}\n"
+            f"  Температура: {temp_c}°C (предупреждение {a.get('wctemp', 0) - 273}°C, "
+            f"критическая {a.get('cctemp', 0) - 273}°C)\n"
+            f"  Всего выше порога предупреждения: {a.get('warning_temp_time', 0)} мин, "
+            f"выше критического: {a.get('critical_temp_time', 0)} мин\n"
+            f"  Наработка: {a.get('SmartPowerOnHours', 0)} ч, включений: {a.get('power_cycles', 0)}\n"
+            f"  Небезопасных выключений: {a.get('unsafe_shutdowns', 0)} — каждое пропадание питания/жёсткий сброс\n"
+            f"  Записано: {human(a.get('total_data_written', 0))}, прочитано: {human(a.get('total_data_read', 0))}"
+            + ("\n  Внимание: " + "; ".join(notes) if notes else ""))
+    return CheckResult("ssd", title, worst, " | ".join(summaries) or "нет данных", "\n\n".join(parts))
+
+
+# Ошибки, которые всегда серьёзны: железо, диск, файловая система, зависания GPU
+SERIOUS_KERNEL = re.compile(
+    r"Hardware Error|mce: |Machine check|nvme.*(timeout|reset|I/O error)|PCIe Bus Error|AER:.*(Uncorrected|Fatal)|"
+    r"EXT4-fs error|BTRFS (error|critical)|I/O error, dev|GPU HANG|gpu hang|\*ERROR\* .*(reset|hang)|watchdog: BUG",
+    re.I)
+BOOT_PHASE_S = 120  # ошибки первых двух минут — инициализация (кривые таблицы ACPI и т.п.)
+
+
+def normalize_kernel_msg(msg: str) -> str:
+    msg = re.sub(r"\(\d{8}/[\w-]+-\d+\)", "", msg)        # (20251212/psparse-543)
+    msg = re.sub(r"0x[0-9a-fA-F]+|\b[0-9a-f]{12,}\b|\b\d+\b", "N", msg)
+    return msg.strip()
+
+
+def parse_kernel_errors(out: str) -> list[tuple[float, str]]:
+    res = []
+    for line in out.splitlines():
+        m = re.match(r"\[\s*([\d.]+)\]\s+\S+\s+kernel:\s*(.*)", line)
+        if m:
+            res.append((float(m.group(1)), m.group(2)))
+    return res
+
+
+def check_kernel(cfg: Config) -> CheckResult:
+    title = "Ошибки ядра"
+    out = run(["journalctl", "-k", "-b", "-p", "err", "-o", "short-monotonic", "--no-pager"], timeout=30)
+    if out is None:
+        return CheckResult(title, title, Status.INFO, "Журнал ядра недоступен")
+    errs = parse_kernel_errors(out)
+    ignore = [re.compile(x) for x in cfg.kernel_error_ignore]
+    serious = [(t, m) for t, m in errs if SERIOUS_KERNEL.search(m)]
+    runtime = [(t, m) for t, m in errs if t > BOOT_PHASE_S and (t, m) not in serious
+               and not any(r.search(m) for r in ignore)]
+    ignored = [(t, m) for t, m in errs if t > BOOT_PHASE_S and any(r.search(m) for r in ignore)]
+    boot = [(t, m) for t, m in errs if t <= BOOT_PHASE_S and (t, m) not in serious]
+
+    def group(items, limit=12):
+        g: dict[str, list[float]] = {}
+        for t, m in items:
+            g.setdefault(normalize_kernel_msg(m), []).append(t)
+        rows = sorted(g.items(), key=lambda kv: -len(kv[1]))[:limit]
+        return "\n".join(f"  {len(ts):>4}×  {msg[:150]}" for msg, ts in rows)
+
+    parts = []
+    if serious:
+        parts.append("СЕРЬЁЗНЫЕ (железо/диск/GPU):\n" + group(serious))
+    if runtime:
+        parts.append("Во время работы:\n" + group(runtime))
+    if ignored:
+        parts.append(f"Известный шум (kernel_error_ignore), во время работы: {len(ignored)}\n" + group(ignored, 5))
+    if boot:
+        parts.append(f"При загрузке (первые {BOOT_PHASE_S} с; обычно кривые таблицы ACPI в BIOS — безвредно): "
+                     f"{len(boot)}\n" + group(boot, 6))
+    details = "\n\n".join(parts) or "Ошибок ядра с момента загрузки нет."
+    details += ("\n\nПовторяющийся безвредный шум можно добавить в kernel_error_ignore (регулярки) в настройках."
+                if runtime else "")
+    if serious:
+        return CheckResult("kernel", title, Status.ERROR, f"Серьёзных ошибок: {len(serious)}", details)
+    if runtime:
+        return CheckResult("kernel", title, Status.WARN, f"Во время работы: {len(runtime)} ошибок", details)
+    return CheckResult("kernel", title, Status.OK,
+                       f"Нет новых ошибок (при загрузке {len(boot)}, шум {len(ignored)})", details)
+
+
 def parse_journal_mb(out: str) -> float | None:
     m = re.search(r"take up ([\d.]+)([KMGT])", out)
     if not m:
@@ -567,6 +823,77 @@ def check_journal(cfg: Config) -> CheckResult:
     return CheckResult("journal", "Журнал systemd", Status.OK, f"{mb:.0f} МБ")
 
 
+_updates_cache: tuple[float, dict] | None = None
+UPDATES_TTL_S = 6 * 3600  # snap и fwupd ходят в сеть — не чаще раза в 6 часов
+
+
+def collect_updates() -> dict:
+    res: dict = {"apt": None, "apt_security": None, "snap": [], "fw": [], "flatpak": None}
+    from .util import run_full
+    code, out = run_full(["/usr/lib/update-notifier/apt-check"], timeout=60)  # печатает "всего;безопасности" в stderr
+    m = re.search(r"(\d+);(\d+)", out)
+    if m:
+        res["apt"], res["apt_security"] = int(m.group(1)), int(m.group(2))
+    else:
+        lst = run(["apt", "list", "--upgradable"], timeout=60) or ""
+        res["apt"] = sum(1 for ln in lst.splitlines() if "/" in ln)
+    snaps = run(["snap", "refresh", "--list"], timeout=60) or ""
+    res["snap"] = [ln.split()[0] for ln in snaps.splitlines()[1:] if ln.strip()]
+    fw = run(["fwupdmgr", "get-updates", "--json", "--no-unreported-check", "--no-metadata-check"], timeout=60,
+             ok_codes=(0, 2))
+    try:
+        res["fw"] = [f"{d.get('Name')}: {d.get('Version')} → {(d.get('Releases') or [{}])[0].get('Version')}"
+                     for d in json.loads(fw or "{}").get("Devices", [])]
+    except json.JSONDecodeError:
+        pass
+    if shutil.which("flatpak"):
+        fp = run(["flatpak", "remote-ls", "--updates", "--columns=application"], timeout=60)
+        res["flatpak"] = len([x for x in (fp or "").splitlines() if x.strip()]) if fp is not None else None
+    return res
+
+
+def open_discover() -> list[str]:
+    import subprocess
+    subprocess.Popen(["plasma-discover", "--mode", "update"], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return ["✓ открыт Discover — обновления там"]
+
+
+def check_updates(cfg: Config) -> CheckResult:
+    import time
+    global _updates_cache
+    title = "Обновления"
+    if _updates_cache is None or time.time() - _updates_cache[0] > UPDATES_TTL_S:
+        _updates_cache = (time.time(), collect_updates())
+    checked, u = _updates_cache
+    apt, sec, snaps, fw, fp = u["apt"], u["apt_security"], u["snap"], u["fw"], u["flatpak"]
+    total = (apt or 0) + len(snaps) + len(fw) + (fp or 0)
+    details = (f"Пакеты apt: {apt if apt is not None else '?'}"
+               + (f", из них безопасности: {sec}" if sec is not None else "") + "\n"
+               f"Snap: {len(snaps)}" + (f" ({', '.join(snaps[:12])})" if snaps else "") + "\n"
+               + (f"Flatpak: {fp}\n" if fp is not None else "")
+               + "Прошивки (fwupd): " + ("; ".join(fw) if fw else "нет") + "\n"
+               + f"\nПроверено в {datetime.fromtimestamp(checked):%H:%M}, повторно — через 6 часов.")
+    fix = Fix("Открыть Discover", "Открыть центр программ Discover на странице обновлений?",
+              py_action=open_discover) if total and shutil.which("plasma-discover") else None
+    parts = []
+    if sec:
+        parts.append(f"{sec} обновлений безопасности")
+    if apt:
+        parts.append(f"apt {apt}")
+    if snaps:
+        parts.append(f"snap {len(snaps)}")
+    if fw:
+        parts.append(f"прошивки {len(fw)}")
+    if fp:
+        parts.append(f"flatpak {fp}")
+    if sec or fw:
+        return CheckResult("updates", title, Status.WARN, ", ".join(parts), details, fix)
+    if total:
+        return CheckResult("updates", title, Status.INFO, ", ".join(parts), details, fix)
+    return CheckResult("updates", title, Status.OK, "Всё обновлено", details)
+
+
 def check_reboot_required(cfg: Config) -> CheckResult:
     if Path("/run/reboot-required").exists():
         pkgs = read("/run/reboot-required.pkgs", "") or ""
@@ -577,9 +904,9 @@ def check_reboot_required(cfg: Config) -> CheckResult:
 
 CHECKS: list[Callable[[Config], CheckResult]] = [
     check_resets, check_dgpu, check_temps, check_battery,
-    check_docker_loops, check_docker_cpu, check_abandoned,
+    check_docker_loops, check_unhealthy, check_docker_cpu, check_abandoned,
     check_failed, check_reenabled,
-    check_memory, check_tests, check_disk, check_journal, check_boot, check_power, check_reboot_required,
+    check_memory, check_tests, check_git, check_ssd, check_kernel, check_disk, check_journal, check_boot, check_power, check_updates, check_reboot_required,
 ]
 
 

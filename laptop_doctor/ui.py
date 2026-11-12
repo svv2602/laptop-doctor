@@ -13,12 +13,14 @@ from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSign
 from PyQt6.QtGui import QAction, QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
+    QComboBox, QGridLayout,
     QAbstractItemView, QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import actions, checks, cleanup, testguard
+from . import actions, checks, cleanup, history, testguard
+from .charts import DayBarChart, LineChart
 from .checks import STATUS_LABEL, CheckResult, Status
 from .config import CONFIG_PATH, Config
 from .util import human
@@ -100,6 +102,8 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_status_tab(), "Состояние")
         tabs.addTab(self._build_cleanup_tab(), "Очистка")
+        tabs.addTab(self._build_history_tab(), "История")
+        tabs.currentChanged.connect(lambda i: self.load_history() if tabs.widget(i) is self.history_tab else None)
         self.setCentralWidget(tabs)
 
     # ---- status tab
@@ -319,6 +323,68 @@ class MainWindow(QMainWindow):
         self.estimate()
         self.app.refresh()
 
+    # ---- history tab
+    PERIODS = [("24 часа", 86400, 3600 / 4), ("7 дней", 7 * 86400, 3600), ("30 дней", 30 * 86400, 6 * 3600)]
+
+    def _build_history_tab(self) -> QWidget:
+        self.history_tab = w = QWidget()
+        lay = QVBoxLayout(w)
+        top = QHBoxLayout()
+        self.period = QComboBox()
+        for name, *_ in self.PERIODS:
+            self.period.addItem(name)
+        self.period.setCurrentIndex(1)
+        self.period.currentIndexChanged.connect(self.load_history)
+        self.hist_note = QLabel()
+        self.hist_note.setWordWrap(True)
+        top.addWidget(QLabel("Период:"))
+        top.addWidget(self.period)
+        top.addWidget(self.hist_note, 1)
+        lay.addLayout(top)
+        grid = QGridLayout()
+        self.ch_temp = LineChart("Температура CPU (p95)", "°C", y_min=None)
+        self.ch_mem = LineChart("Доступно памяти", "%", y_max=100)
+        self.ch_swap = LineChart("Занято swap", " ГБ", fmt="{:.2f}")
+        self.ch_resets = DayBarChart("Жёсткие сбросы за день")
+        grid.addWidget(self.ch_temp, 0, 0)
+        grid.addWidget(self.ch_resets, 0, 1)
+        grid.addWidget(self.ch_mem, 1, 0)
+        grid.addWidget(self.ch_swap, 1, 1)
+        lay.addLayout(grid, 1)
+        return w
+
+    def load_history(self, *_):
+        name, span, bucket = self.PERIODS[self.period.currentIndex()]
+        now = time.time()
+        t0 = now - span
+
+        def collect():
+            rows = history.load(t0)
+            temps = history.temps_from_journal(t0, int(bucket))
+            days = max(7, round(span / 86400))
+            resets = history.resets_per_day(checks.finished_boots(), days)
+            return rows, temps, resets
+
+        self.hist_note.setText("Загружаю…")
+        self._job(collect, lambda res: self._history_loaded(res, t0, now, bucket))
+
+    def _history_loaded(self, res, t0, t1, bucket):
+        if isinstance(res, Exception):
+            self.hist_note.setText(f"Ошибка: {res}")
+            return
+        rows, temps, resets = res
+        self.ch_temp.set_data(temps, t0, t1, gap_s=bucket * 2.5)
+        self.ch_mem.set_data(history.series(rows, "mem_avail_pct"), t0, t1, gap_s=1800)
+        self.ch_swap.set_data(history.series(rows, "swap_used_gb"), t0, t1, gap_s=1800)
+        for ch in (self.ch_mem, self.ch_swap):
+            ch.empty_text = "История копится — замер раз в несколько минут"
+        self.ch_resets.set_data(resets)
+        first = min((r["ts"] for r in rows), default=None)
+        note = "Разрывы линий — ноутбук был выключен или спал. Наведите на график, чтобы увидеть значение."
+        if first:
+            note += f" Память и swap записываются с {datetime.fromtimestamp(first):%d.%m %H:%M}."
+        self.hist_note.setText(note)
+
     # ---- helpers
     def _job(self, fn, cb):
         w = Worker(fn, self)
@@ -370,6 +436,11 @@ class TrayApp(QObject):
         self.tray.show()
 
         self.window = MainWindow(self)
+        try:
+            history.prune(self.cfg.history_days)
+        except OSError:
+            pass
+        self.auto_clean_job: Worker | None = None
         self.timer = QTimer(self, interval=max(1, self.cfg.check_interval_min) * 60_000, timeout=self.refresh)
         self.timer.start()
         QTimer.singleShot(1500, self.refresh)
@@ -490,6 +561,15 @@ class TrayApp(QObject):
                                   QSystemTrayIcon.MessageIcon.Critical, 30000)
         self.refresh()
 
+    def _auto_cleaned(self, res):
+        if isinstance(res, Exception):
+            self.tray.showMessage("Плановая очистка", f"Ошибка: {res}", QSystemTrayIcon.MessageIcon.Warning, 15000)
+            return
+        freed, log = res
+        if freed:
+            self.tray.showMessage(f"Плановая очистка: освобождено {human(freed)}", "\n".join(log)[:400],
+                                  QSystemTrayIcon.MessageIcon.Information, 15000)
+
     def refresh(self):
         if self.worker and self.worker.isRunning():
             return
@@ -508,6 +588,14 @@ class TrayApp(QObject):
         self.tray.setIcon(status_icon(worst))
         self.window.setWindowIcon(status_icon(worst))
         self.window.set_results(results)
+        try:
+            history.record(testguard.mem_snapshot())
+        except OSError:
+            pass
+        if cleanup.auto_clean_due(self.cfg) and not (self.auto_clean_job and self.auto_clean_job.isRunning()):
+            self.auto_clean_job = Worker(lambda: cleanup.run_auto_clean(self.cfg), self)
+            self.auto_clean_job.done.connect(self._auto_cleaned)
+            self.auto_clean_job.start()
         problems = [r for r in results if r.status >= Status.WARN]
         self.tray.setToolTip("Здоровье ноутбука: " + (
             "\n".join(f"• {r.title}: {r.summary}" for r in problems) if problems else "всё в порядке"))

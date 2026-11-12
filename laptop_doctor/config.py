@@ -20,6 +20,8 @@ class Config:
     battery: str = "BAT1"
     battery_threshold: int = 80
     temp_warn_c: int = 90
+    # Процессор троттлит по температуре больше N% времени между проверками — предупреждение
+    throttle_warn_pct: float = 20.0
     disk_warn_free_pct: int = 15
     # Память: предупреждать, если доступно меньше N% RAM, swap занят больше N%,
     # или процессы ждут память больше N% времени (PSI some avg60)
@@ -53,9 +55,23 @@ class Config:
     stopped_containers: list[str] = field(default_factory=list)
     # Системные юниты, которые мы отключили и которые не должны снова включаться
     disabled_units: list[str] = field(default_factory=list)
-    # Где искать Flutter-проекты для чистки build/
-    flutter_roots: list[str] = field(default_factory=lambda: ["~/FlutterProjects"])
-    flutter_build_min_age_days: int = 30
+    # Папки с проектами (git-репозитории на 1–2 уровня вглубь): незапушенная работа и мусор сборки
+    project_roots: list[str] = field(default_factory=list)
+    # Незакоммиченные правки старше N часов — предупреждение
+    git_dirty_warn_hours: int = 24
+    # Репозитории (имя папки или путь), которые не проверять
+    git_ignore: list[str] = field(default_factory=list)
+    # Мусор сборки (node_modules, .venv, target/…) чистится в проектах, не менявшихся N дней
+    dev_artifacts_min_age_days: int = 30
+    # Ошибки ядра: регулярки строк, которые считать шумом (известные баги BIOS и т.п.)
+    kernel_error_ignore: list[str] = field(default_factory=list)
+    # Плановая очистка (только цели без пароля) раз в N дней
+    auto_clean_enabled: bool = False
+    auto_clean_interval_days: int = 7
+    auto_clean_targets: list[str] = field(default_factory=lambda: [
+        "pip", "uv", "npm", "yarn", "thumbs", "docker_dangling"])
+    # История замеров для графиков, дней
+    history_days: int = 30
 
     @classmethod
     def load(cls) -> "Config":
@@ -63,8 +79,12 @@ class Config:
         if CONFIG_PATH.exists():
             try:
                 data = json.loads(CONFIG_PATH.read_text())
-                legacy = {"arc_disabled_since": "fix_applied_since", "arc_pci": "dgpu_pci"}
+                legacy = {"arc_disabled_since": "fix_applied_since", "arc_pci": "dgpu_pci",
+                          "flutter_build_min_age_days": "dev_artifacts_min_age_days"}
                 for k, v in data.items():
+                    if k == "flutter_roots":  # старое имя: папки Flutter-проектов теперь в project_roots
+                        cfg.project_roots = list(dict.fromkeys([*cfg.project_roots, *v]))
+                        continue
                     k = legacy.get(k, k)
                     if hasattr(cfg, k):
                         setattr(cfg, k, v)

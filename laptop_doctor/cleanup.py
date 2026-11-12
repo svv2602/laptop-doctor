@@ -176,23 +176,6 @@ def _dir_target(path: Path) -> Callable[[], tuple[int, str]]:
     return lambda: (dir_size(path), str(path).replace(str(HOME), "~"))
 
 
-def flutter_builds(cfg: Config) -> list[Path]:
-    cutoff = time.time() - cfg.flutter_build_min_age_days * 86400
-    res = []
-    for root in cfg.flutter_roots:
-        r = Path(root).expanduser()
-        if not r.is_dir():
-            continue
-        for pubspec in r.glob("*/pubspec.yaml"):
-            build = pubspec.parent / "build"
-            try:
-                if build.is_dir() and build.stat().st_mtime < cutoff:
-                    res.append(build)
-            except OSError:
-                pass
-    return res
-
-
 def make_targets(cfg: Config) -> list[Target]:
     trash = HOME / ".local/share/Trash"
     user_dirs = [
@@ -225,13 +208,26 @@ def make_targets(cfg: Config) -> list[Target]:
         targets.append(Target(tid, title, note, False, _dir_target(path),
                               (lambda p=path: Plan(empty_paths=[p])), default_checked=(tid != "gradle")))
 
-    def flutter_estimate() -> tuple[int, str]:
-        builds = flutter_builds(cfg)
-        return sum(dir_size(b) for b in builds), f"{len(builds)} проект(ов): " + ", ".join(b.parent.name for b in builds)
+    def dev_estimate() -> tuple[int, str]:
+        from . import projects
+        from .util import dir_sizes, human
+        found = projects.inactive_artifacts(cfg)
+        sizes = dir_sizes([a.path for pa in found for a in pa.artifacts])
+        per = sorted(((sum(sizes.get(a.path, 0) for a in pa.artifacts), pa.project.name) for pa in found), reverse=True)
+        total = sum(x for x, _ in per)
+        if not cfg.project_roots:
+            return 0, "не настроено (project_roots)"
+        return total, f"{len(per)} проект(ов): " + ", ".join(f"{n} {human(x)}" for x, n in per[:6]) + \
+            ("…" if len(per) > 6 else "")
 
-    targets.append(Target("flutter", f"Сборки Flutter старше {cfg.flutter_build_min_age_days} дн.",
-                          "папки build/ — пересоздаются при следующей сборке", False,
-                          flutter_estimate, lambda: Plan(remove_paths=flutter_builds(cfg))))
+    def dev_plan() -> Plan:
+        from . import projects
+        return Plan(remove_paths=[a.path for pa in projects.inactive_artifacts(cfg) for a in pa.artifacts])
+
+    targets.append(Target("dev_artifacts", f"Мусор сборки в проектах, не менявшихся {cfg.dev_artifacts_min_age_days}+ дн.",
+                          "node_modules, .venv, target/, .dart_tool, build/ — пересоздаются при следующей "
+                          "установке/сборке; проекты с работающими контейнерами не трогаются", False,
+                          dev_estimate, dev_plan))
     return targets
 
 
@@ -265,3 +261,54 @@ def apply_user_paths(plan: Plan) -> list[str]:
                 log.append(f"не удалось: {child}: {e}")
         log.append(f"очищено: {rp}")
     return log
+
+
+# ------------------------------------------------------------------ плановая очистка
+
+STATE = Path.home() / ".local" / "state" / "laptop-doctor" / "state.json"
+
+
+def _state() -> dict:
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_state(d: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(d))
+
+
+def auto_clean_due(cfg: Config, now: float | None = None) -> bool:
+    if not cfg.auto_clean_enabled:
+        return False
+    last = _state().get("last_auto_clean", 0)
+    return (now or time.time()) - last >= cfg.auto_clean_interval_days * 86400
+
+
+def run_auto_clean(cfg: Config) -> tuple[int, list[str]]:
+    """Чистит цели из auto_clean_targets, которым не нужен пароль. Возвращает (освобождено байт, лог)."""
+    from .actions import run_user
+    from .util import human
+    chosen = [t for t in make_targets(cfg) if t.id in cfg.auto_clean_targets and not t.needs_root]
+    freed, log = 0, []
+    for t in chosen:
+        size, _ = t.estimate()
+        if not size:
+            continue
+        plan = t.plan()
+        if plan.root_actions:  # на всякий случай: без пароля в фоне ничего от root
+            continue
+        ok, out = run_user(plan.user_cmds) if plan.user_cmds else (True, "")
+        log += apply_user_paths(plan)
+        if ok:
+            freed += size
+            log.append(f"✓ {t.title}: {human(size)}")
+        else:
+            log.append(f"✗ {t.title}: {out[-200:]}")
+    st = _state()
+    st["last_auto_clean"] = time.time()
+    st["last_auto_clean_freed"] = freed
+    _save_state(st)
+    return freed, log

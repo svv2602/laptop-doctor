@@ -6,7 +6,8 @@ import subprocess
 from pathlib import Path
 
 
-def run(cmd: list[str], timeout: float = 30, ok_codes: tuple[int, ...] = (0,)) -> str | None:
+def run(cmd: list[str], timeout: float = 30, ok_codes: tuple[int, ...] = (0,),
+        env: dict[str, str] | None = None) -> str | None:
     """Run a command, return stdout or None on failure/timeout/missing binary."""
     try:
         p = subprocess.run(
@@ -14,7 +15,7 @@ def run(cmd: list[str], timeout: float = 30, ok_codes: tuple[int, ...] = (0,)) -
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "LC_ALL": "C.UTF-8"},
+            env={**os.environ, "LC_ALL": "C.UTF-8", **(env or {})},
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError):
         return None
@@ -105,3 +106,17 @@ def dir_size(path: Path, timeout: float = 300) -> int:
         return int(out.split()[0])
     except (ValueError, IndexError):
         return 0
+
+
+def dir_sizes(paths: list[Path], timeout: float = 600) -> dict[Path, int]:
+    """Размеры нескольких папок одним вызовом du."""
+    existing = [p for p in paths if p.exists()]
+    if not existing:
+        return {}
+    out = run(["du", "-sb", "--", *map(str, existing)], timeout=timeout, ok_codes=(0, 1)) or ""
+    res = {}
+    for line in out.splitlines():
+        size, _, path = line.partition("\t")
+        if size.isdigit():
+            res[Path(path)] = int(size)
+    return res
