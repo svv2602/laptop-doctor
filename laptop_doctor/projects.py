@@ -17,6 +17,12 @@ def git(repo: Path, *args: str, timeout: float = 20) -> str | None:
     return run(["git", "-C", str(repo), *args], timeout=timeout, env=GIT_ENV)
 
 
+def is_repo(p: Path) -> bool:
+    """Настоящий git-репозиторий: .git с HEAD или файл .git (рабочая копия worktree). Пустая папка .git — нет."""
+    g = p / ".git"
+    return g.is_file() or (g / "HEAD").exists()
+
+
 def _ignored(p: Path, cfg: Config) -> bool:
     return p.name in cfg.git_ignore or str(p) in {str(Path(x).expanduser()) for x in cfg.git_ignore}
 
@@ -32,17 +38,17 @@ def project_dirs(cfg: Config) -> list[Path]:
             if not child.is_dir() or child.name.startswith(".") or _ignored(child, cfg):
                 continue
             res.append(child)
-            if not (child / ".git").exists():
+            if not is_repo(child):
                 try:
                     res += [g for g in sorted(child.iterdir())
-                            if g.is_dir() and (g / ".git").exists() and not _ignored(g, cfg)]
+                            if g.is_dir() and is_repo(g) and not _ignored(g, cfg)]
                 except OSError:
                     pass
     return res
 
 
 def repos(cfg: Config) -> list[Path]:
-    return [p for p in project_dirs(cfg) if (p / ".git").exists()]
+    return [p for p in project_dirs(cfg) if is_repo(p)]
 
 
 # ------------------------------------------------------------------ git state
@@ -165,7 +171,7 @@ def _artifacts_in(d: Path) -> list[Artifact]:
 def last_activity(p: Path) -> float:
     """Когда проект последний раз трогали: последний коммит, свежие правки, файлы верхнего уровня."""
     times = [0.0]
-    if (p / ".git").exists():
+    if is_repo(p):
         times.append(float((git(p, "log", "-1", "--format=%ct") or "0").strip() or 0))
         times.append((p / ".git" / "index").stat().st_mtime if (p / ".git" / "index").exists() else 0)
     skip = {"node_modules", ".venv", "venv", "target", ".dart_tool", "build", ".next", ".git", ".idea"}
@@ -179,6 +185,12 @@ def last_activity(p: Path) -> float:
     except OSError:
         pass
     return max(times)
+
+
+def tracked_by_git(path: Path) -> bool:
+    """Есть ли в папке хоть один файл, закоммиченный в git (иногда node_modules кладут в репозиторий)."""
+    out = run(["git", "-C", str(path.parent), "ls-files", "--", path.name], timeout=30, env=GIT_ENV)
+    return bool(out and out.strip())
 
 
 def running_compose_dirs() -> list[Path]:
@@ -205,7 +217,8 @@ def inactive_artifacts(cfg: Config) -> list[ProjectArtifacts]:
                     arts += _artifacts_in(sub)
         except OSError:
             pass
-        arts = [a for a in arts if a.path.resolve() not in seen]
+        # папку, в которой есть файлы под git, не трогаем: удаление превратится в «удалённые файлы» в репозитории
+        arts = [a for a in arts if a.path.resolve() not in seen and not tracked_by_git(a.path)]
         seen.update(a.path.resolve() for a in arts)
         if arts:
             res.append(ProjectArtifacts(p, act, arts))

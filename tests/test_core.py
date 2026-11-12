@@ -659,3 +659,30 @@ def test_report_build():
                               "resets_after": 0, "days_after": 0.1})
     assert "## Система" in text and "| Внимание | Открытые порты | Доступны из сети: 3316 |" in text
     assert "94 °C → 78 °C" in text and "детали | тут" in text
+
+
+def test_inactive_artifacts_skips_git_tracked(tmp_path, monkeypatch):
+    from laptop_doctor.config import Config
+    monkeypatch.setattr(projects, "running_compose_dirs", lambda: [])
+    root = tmp_path / "p"
+    proj = root / "site"
+    (proj / "node_modules" / "pw").mkdir(parents=True)
+    (proj / "package.json").write_text("{}")
+    (proj / "node_modules" / "pw" / "index.js").write_text("x")
+    _git(proj, "init", "-q", "-b", "main")
+    _git(proj, "add", ".")
+    _git(proj, "commit", "-q", "-m", "node_modules закоммичен")
+    old = _time.time() - 90 * 86400
+    for e in [proj, *proj.rglob("*")]:
+        _os.utime(e, (old, old))
+    cfg = Config()
+    cfg.project_roots = [str(root)]
+    assert projects.inactive_artifacts(cfg) == []
+
+
+def test_empty_git_dir_is_not_repo(tmp_path):
+    (tmp_path / "fake" / ".git").mkdir(parents=True)
+    real = tmp_path / "real"
+    real.mkdir()
+    _git(real, "init", "-q")
+    assert not projects.is_repo(tmp_path / "fake") and projects.is_repo(real)
