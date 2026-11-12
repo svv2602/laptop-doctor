@@ -410,6 +410,92 @@ def check_disk(cfg: Config) -> CheckResult:
                        "Очистка — на вкладке «Очистка»." if status else "")
 
 
+def parse_meminfo(text: str) -> dict[str, int]:
+    """/proc/meminfo -> {ключ: байты}."""
+    res = {}
+    for line in text.splitlines():
+        m = re.match(r"(\w+):\s+(\d+)(?:\s+kB)?", line)
+        if m:
+            res[m.group(1)] = int(m.group(2)) * (1024 if "kB" in line else 1)
+    return res
+
+
+def parse_psi_avg60(text: str) -> float:
+    """/proc/pressure/memory -> some avg60 (% времени, когда задачи ждали память)."""
+    m = re.search(r"some avg10=[\d.]+ avg60=([\d.]+)", text)
+    return float(m.group(1)) if m else 0.0
+
+
+def top_memory(n: int = 10) -> list[tuple[int, str, int]]:
+    """Приложения по суммарному RSS всех их процессов: (байты, имя, число процессов)."""
+    out = run(["ps", "-eo", "rss=,comm="]) or ""
+    agg: dict[str, list[int]] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            a = agg.setdefault(parts[1].strip(), [0, 0])
+            a[0] += int(parts[0]) * 1024
+            a[1] += 1
+    return sorted(((v[0], k, v[1]) for k, v in agg.items()), reverse=True)[:n]
+
+
+def oom_kills(days: int = 7) -> list[str]:
+    log = run(["journalctl", "-k", "--since", f"-{days}d", "-o", "short", "--no-pager"], timeout=30) or ""
+    kills = [line for line in log.splitlines() if re.search(r"Out of memory: Killed process|oom-kill:", line)]
+    oomd = run(["journalctl", "-u", "systemd-oomd", "--since", f"-{days}d", "-o", "short", "--no-pager"], timeout=20) or ""
+    kills += [line for line in oomd.splitlines() if "Killed" in line]
+    return kills
+
+
+def check_memory(cfg: Config) -> CheckResult:
+    from .util import human
+    mi = parse_meminfo(read("/proc/meminfo", "") or "")
+    total, avail = mi.get("MemTotal", 0), mi.get("MemAvailable", 0)
+    if not total:
+        return CheckResult("memory", "Память и swap", Status.INFO, "Нет данных /proc/meminfo")
+    used = total - avail
+    avail_pct = avail / total * 100
+    sw_total, sw_free = mi.get("SwapTotal", 0), mi.get("SwapFree", 0)
+    sw_used = sw_total - sw_free
+    sw_pct = sw_used / sw_total * 100 if sw_total else 0.0
+    psi = parse_psi_avg60(read("/proc/pressure/memory", "") or "")
+    kills = oom_kills()
+
+    summary = f"Занято {human(used)} из {human(total)}"
+    summary += f", swap {human(sw_used)} ({sw_pct:.0f}%)" if sw_total else ", swap нет"
+    problems = []
+    if avail_pct < cfg.mem_warn_available_pct:
+        problems.append(f"свободной памяти меньше {cfg.mem_warn_available_pct}%")
+    if sw_total and sw_pct >= cfg.swap_warn_used_pct:
+        problems.append(f"swap занят на {sw_pct:.0f}%")
+    if psi >= cfg.mem_pressure_warn_pct:
+        problems.append(f"задачи ждут память {psi:.1f}% времени")
+    if kills:
+        problems.append(f"убито из-за нехватки памяти: {len(kills)} за 7 дней")
+
+    details = (f"Память: занято {human(used)}, доступно {human(avail)} ({avail_pct:.0f}%) из {human(total)}\n"
+               f"  кэш файлов {human(mi.get('Cached', 0))} — не входит в «занято», ядро отдаёт его по требованию\n")
+    if sw_total:
+        details += f"Swap: занято {human(sw_used)} из {human(sw_total)} ({sw_pct:.0f}%)"
+        if mi.get("Zswapped"):
+            details += f", сжато в zswap {human(mi['Zswapped'])}"
+        details += "\n"
+    else:
+        details += "Swap: не настроен\n"
+    details += (f"Давление памяти (PSI, 60 с): {psi:.1f}% — доля времени, когда процессы ждали память.\n"
+                "Это лучший признак реальной нехватки: занятый swap сам по себе не страшен.\n\n")
+    details += ("Больше всех занимают (RSS всех процессов приложения; у многопроцессных, как браузер, "
+                "сумма завышена — общие страницы считаются в каждом процессе):\n") + "\n".join(
+        f"{human(b):>10}  {name}" + (f" ({n} проц.)" if n > 1 else "") for b, name, n in top_memory())
+    if kills:
+        details += "\n\nУбийства из-за нехватки памяти:\n" + "\n".join(kills[-8:])
+
+    if problems:
+        status = Status.ERROR if kills or psi >= cfg.mem_pressure_warn_pct * 3 else Status.WARN
+        return CheckResult("memory", "Память и swap", status, summary + " — " + "; ".join(problems), details)
+    return CheckResult("memory", "Память и swap", Status.OK, summary, details)
+
+
 def parse_journal_mb(out: str) -> float | None:
     m = re.search(r"take up ([\d.]+)([KMGT])", out)
     if not m:
@@ -440,7 +526,7 @@ CHECKS: list[Callable[[Config], CheckResult]] = [
     check_resets, check_dgpu, check_temps, check_battery,
     check_docker_loops, check_docker_cpu, check_abandoned,
     check_failed, check_reenabled,
-    check_disk, check_journal, check_boot, check_power, check_reboot_required,
+    check_memory, check_disk, check_journal, check_boot, check_power, check_reboot_required,
 ]
 
 

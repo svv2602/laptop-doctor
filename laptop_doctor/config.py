@@ -21,6 +21,11 @@ class Config:
     battery_threshold: int = 80
     temp_warn_c: int = 90
     disk_warn_free_pct: int = 15
+    # Память: предупреждать, если доступно меньше N% RAM, swap занят больше N%,
+    # или процессы ждут память больше N% времени (PSI some avg60)
+    mem_warn_available_pct: int = 10
+    swap_warn_used_pct: int = 50
+    mem_pressure_warn_pct: float = 5.0
     journal_warn_mb: int = 1024
     boot_userspace_warn_s: float = 15.0
     docker_cpu_warn_pct: float = 25.0

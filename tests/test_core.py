@@ -150,3 +150,28 @@ def test_personal_checks_skip_when_unconfigured():
     assert checks.check_dgpu(cfg).status == checks.Status.INFO
     assert checks.check_reenabled(cfg).status == checks.Status.INFO
     assert checks.check_abandoned(cfg).status == checks.Status.INFO
+
+
+def test_meminfo_and_psi():
+    mi = checks.parse_meminfo("MemTotal:       31951972 kB\nMemAvailable:   22245952 kB\nHugePages_Total:       0\n")
+    assert mi["MemTotal"] == 31951972 * 1024
+    assert mi["HugePages_Total"] == 0
+    psi = "some avg10=1.20 avg60=7.50 avg300=0.10 total=2174738\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"
+    assert checks.parse_psi_avg60(psi) == 7.5
+    assert checks.parse_psi_avg60("") == 0.0
+
+
+def test_memory_status(monkeypatch):
+    from laptop_doctor.config import Config
+    gib = 1024 * 1024  # в kB
+    meminfo = (f"MemTotal: {32 * gib} kB\nMemAvailable: {2 * gib} kB\n"
+               f"SwapTotal: {32 * gib} kB\nSwapFree: {10 * gib} kB\nCached: 0 kB\nShmem: 0 kB\n")
+    files = {"/proc/meminfo": meminfo, "/proc/pressure/memory": "some avg10=0 avg60=1.00 avg300=0 total=1"}
+    monkeypatch.setattr(checks, "read", lambda p, d=None: files.get(str(p), d))
+    monkeypatch.setattr(checks, "top_memory", lambda n=10: [(5 * 1024 ** 3, "chrome", 30)])
+    monkeypatch.setattr(checks, "oom_kills", lambda days=7: [])
+    r = checks.check_memory(Config())
+    assert r.status == checks.Status.WARN  # доступно 6% и swap 69%
+    assert "swap занят на 69%" in r.summary and "chrome (30 проц.)" in r.details
+    monkeypatch.setattr(checks, "oom_kills", lambda days=7: ["kernel: Out of memory: Killed process 1 (x)"])
+    assert checks.check_memory(Config()).status == checks.Status.ERROR
